@@ -2,6 +2,7 @@ from share import *
 import config # Assuming this config module still has necessary global settings
 
 import os
+import json
 import cv2
 import einops
 # import gradio as gr
@@ -183,6 +184,69 @@ def process(
         return [x_samples[i] for i in range(num_samples_per_inference)]
 
 
+def save_generation_state(args, mask_paths, run_output_dir, filename='generate_state.json'):
+    """
+    Save the generation 'situation' to a JSON file. This includes:
+    - the parsed `args` (as a dict)
+    - the list of mask paths that will be processed
+    - a small set of simple values from the `config` module
+
+    The file is written to `<run_output_dir>/<filename>` and the
+    full path is returned.
+    """
+    state = {}
+    # args -> dict
+    try:
+        state['args'] = vars(args)
+    except Exception:
+        # Fallback: try to coerce to dict
+        try:
+            state['args'] = dict(args)
+        except Exception:
+            state['args'] = str(args)
+
+    # mask paths
+    state['mask_paths'] = list(mask_paths)
+
+    # capture simple config values (str/int/float/bool/list/dict/None)
+    cfg = {}
+    for name in dir(config):
+        if name.startswith('_'):
+            continue
+        try:
+            value = getattr(config, name)
+        except Exception:
+            continue
+        if isinstance(value, (str, int, float, bool, list, dict, type(None))):
+            # Ensure JSON serializable
+            try:
+                json.dumps({name: value})
+                cfg[name] = value
+            except Exception:
+                # skip non-serializable
+                continue
+    state['config'] = cfg
+
+    # timestamp for when this state was saved
+    state['saved_at'] = datetime.datetime.now().isoformat()
+
+    os.makedirs(run_output_dir, exist_ok=True)
+    filepath = os.path.join(run_output_dir, filename)
+    with open(filepath, 'w') as f:
+        json.dump(state, f, indent=2)
+
+    print(f"Saved generation state to {filepath}")
+    return filepath
+
+
+def load_generation_state(filepath):
+    """Load a generation state JSON file saved by `save_generation_state`.
+    Returns the parsed dict.
+    """
+    with open(filepath, 'r') as f:
+        return json.load(f)
+
+
 # --- Main Script Logic ---
 def main():
     args = parse_args()
@@ -241,6 +305,11 @@ def main():
     timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_output_dir = os.path.join(args.output_base_dir, f"run_{timestamp_str}")
     os.makedirs(run_output_dir, exist_ok=True)
+    # Save the generation state (args, mask list, small config snapshot)
+    try:
+        save_generation_state(args, mask_paths, run_output_dir)
+    except Exception as e:
+        print(f"Warning: failed to save generation state: {e}")
 
     img_save_path_base = os.path.join(run_output_dir, "images")
     mask_save_path_base = os.path.join(run_output_dir, "masks")
