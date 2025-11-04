@@ -277,8 +277,20 @@ def find_cached_weights(url: str, repo_root: Path) -> Optional[Path]:
     filename = Path(parsed.path).name
     if not filename:
         return None
-    candidate = repo_root / "fid" / "weights" / filename
-    return candidate if candidate.is_file() else None
+    search_dirs = [
+        repo_root / "weights",
+        repo_root / "fid" / "weights",
+        repo_root.parent / "fid" / "weights"
+        if repo_root.parent != repo_root
+        else None,
+    ]
+    for directory in search_dirs:
+        if directory is None:
+            continue
+        candidate = directory / filename
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def extract_mocov2_backbone(
