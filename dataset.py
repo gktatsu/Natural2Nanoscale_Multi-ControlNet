@@ -16,20 +16,23 @@ def is_image_not_augmented(filename):
     return bool(pattern.match(filename))
 
 class MyDataset(Dataset):
-    def __init__(self, imagePaths, maskPaths):
+    def __init__(self, imagePaths, maskPaths, augment=True):
         self.imagePaths = sorted(glob.glob(imagePaths+"/*.png"))
         self.maskPaths = sorted(glob.glob(maskPaths+"/*.png"))
 
         print("Using EM-Dataset number images" + str(len(self.imagePaths)))
 
-        self.transforms = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(),
-            transforms.RandomRotation(degrees=(0, 360)),
-            transforms.RandomResizedCrop(size=(512, 512), scale=(0.08, 1.0)),
-            # transforms.ColorJitter(brightness=0.4),
-        ])
+        if augment:
+            self.transforms = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomVerticalFlip(),
+                transforms.RandomRotation(degrees=(0, 360)),
+                transforms.RandomResizedCrop(size=(512, 512), scale=(0.08, 1.0)),
+                # transforms.ColorJitter(brightness=0.4),
+            ])
+        else:
+            self.transforms = None
 
         self.prompts = [
             "A realistic scientific image of a cell taken from an electron microscope, photorealistic style, very detailed, black, white, detail",

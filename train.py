@@ -58,6 +58,18 @@ def parse_args():
         help="Path to the directory containing training masks."
     )
     parser.add_argument(
+        "--val_image_path",
+        type=str,
+        default=None,
+        help="Path to the directory containing validation images."
+    )
+    parser.add_argument(
+        "--val_mask_path",
+        type=str,
+        default=None,
+        help="Path to the directory containing validation masks."
+    )
+    parser.add_argument(
         "--resume_path",
         type=str,
         default='./models/control_sd15_ini.ckpt',
@@ -139,20 +151,28 @@ def main():
     )
     wandb_logger = pl.loggers.WandbLogger(save_dir=output_dir, project=args.wandb_project, log_model='all')
 
+    # --- Data Loading ---
+    train_dataset = MyDataset(args.image_path, args.mask_path, augment=True)
+    train_loader = DataLoader(train_dataset, num_workers=args.num_workers, batch_size=args.batch_size, shuffle=True)
+
+    val_loader = None
+    checkpoint_monitor = 'train/loss_epoch'
+    if args.val_image_path and args.val_mask_path:
+        val_dataset = MyDataset(args.val_image_path, args.val_mask_path, augment=False)
+        val_loader = DataLoader(val_dataset, num_workers=args.num_workers, batch_size=args.batch_size, shuffle=False)
+        checkpoint_monitor = 'val/loss'
+
     # --- Checkpointing ---
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
         dirpath=output_dir,
         filename=f'EM_best_results',
         save_weights_only=True,
-        monitor= 'train/loss_epoch', #'val_loss', # Often good to monitor a metric, e.g., validation loss
-        mode='min',         # 'min' for loss, 'max' for accuracy
-        save_top_k=1,       # Save only the best model
+        monitor=checkpoint_monitor,
+        mode='min',
+        save_top_k=1,
         verbose=True
     )
 
-    # --- Data Loading ---
-    dataset = MyDataset(args.image_path, args.mask_path)
-    dataloader = DataLoader(dataset, num_workers=args.num_workers, batch_size=args.batch_size, shuffle=True)
     logger = ImageLogger(batch_frequency=args.logger_freq)
 
     # --- Trainer Setup ---
@@ -166,7 +186,10 @@ def main():
     )
 
     # --- Train! ---
-    trainer.fit(model, dataloader)
+    if val_loader is not None:
+        trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    else:
+        trainer.fit(model, train_dataloaders=train_loader)
 
 if __name__ == "__main__":
     main()
