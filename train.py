@@ -472,7 +472,7 @@ def main():
         config=vars(args), # Log all argparse arguments to WandB config
         name=f"training_run_{timestamp_str}" # Optional: add a run name
     )
-    wandb_logger = pl.loggers.WandbLogger(save_dir=output_dir, project=args.wandb_project, log_model='all')
+    wandb_logger = pl.loggers.WandbLogger(save_dir=output_dir, project=args.wandb_project, log_model=False)
 
     # --- Data Loading ---
     train_dataset = MyDataset(args.image_path, args.mask_path, augment=True)
