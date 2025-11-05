@@ -69,7 +69,8 @@ class ValidationFIDCallback(pl.Callback):
         self.download_dir = Path(download_dir).resolve() if download_dir else None
         self.random_seed = random_seed
 
-        self.repo_root = Path(__file__).resolve().parent
+        fid_module_path = Path(cem_fid.__file__).resolve()
+        self.repo_root = cem_fid.find_repo_root(fid_module_path)
         self._fid_model: Optional[torch.nn.Module] = None
         self._fid_transform = None
         self._real_stats: Optional[cem_fid.FeatureStats] = None
