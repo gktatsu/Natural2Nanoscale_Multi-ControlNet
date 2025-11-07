@@ -303,6 +303,12 @@ def parse_args():
         help="Path to the directory containing training masks."
     )
     parser.add_argument(
+        "--edge_path",
+        type=str,
+        default=None,
+        help="Path to the directory containing training edge maps."
+    )
+    parser.add_argument(
         "--val_image_path",
         type=str,
         default=None,
@@ -313,6 +319,19 @@ def parse_args():
         type=str,
         default=None,
         help="Path to the directory containing validation masks."
+    )
+    parser.add_argument(
+        "--val_edge_path",
+        type=str,
+        default=None,
+        help="Path to the directory containing validation edge maps."
+    )
+    parser.add_argument(
+        "--condition_type",
+        type=str,
+        default="segmentation",
+        choices=["segmentation", "edge"],
+        help="Condition modality to use for ControlNet conditioning."
     )
     parser.add_argument(
         "--enable_val_fid",
@@ -475,13 +494,41 @@ def main():
     wandb_logger = pl.loggers.WandbLogger(save_dir=output_dir, project=args.wandb_project, log_model=False)
 
     # --- Data Loading ---
-    train_dataset = MyDataset(args.image_path, args.mask_path, augment=True)
+    if args.condition_type == "segmentation":
+        train_condition_dir = args.mask_path
+        if train_condition_dir is None:
+            raise ValueError("--mask_path must be provided when condition_type is 'segmentation'.")
+    else:
+        train_condition_dir = args.edge_path
+        if train_condition_dir is None:
+            raise ValueError("--edge_path must be provided when condition_type is 'edge'.")
+
+    train_dataset = MyDataset(
+        args.image_path,
+        train_condition_dir,
+        augment=True,
+        condition_type=args.condition_type,
+    )
     train_loader = DataLoader(train_dataset, num_workers=args.num_workers, batch_size=args.batch_size, shuffle=True)
 
     val_loader = None
     checkpoint_monitor = 'train/loss_epoch'
-    if args.val_image_path and args.val_mask_path:
-        val_dataset = MyDataset(args.val_image_path, args.val_mask_path, augment=False)
+    if args.val_image_path:
+        if args.condition_type == "segmentation":
+            val_condition_dir = args.val_mask_path
+            if val_condition_dir is None:
+                raise ValueError("--val_mask_path must be provided when condition_type is 'segmentation'.")
+        else:
+            val_condition_dir = args.val_edge_path
+            if val_condition_dir is None:
+                raise ValueError("--val_edge_path must be provided when condition_type is 'edge'.")
+
+        val_dataset = MyDataset(
+            args.val_image_path,
+            val_condition_dir,
+            augment=False,
+            condition_type=args.condition_type,
+        )
         val_loader = DataLoader(val_dataset, num_workers=args.num_workers, batch_size=args.batch_size, shuffle=False)
         checkpoint_monitor = 'val/loss'
 
