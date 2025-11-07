@@ -20,7 +20,7 @@ from cldm.ddim_hacked import DDIMSampler
 
 # --- Argument Parsing ---
 def parse_args():
-    parser = argparse.ArgumentParser(description="Generate synthetic images using ControlNet based on masks.")
+    parser = argparse.ArgumentParser(description="Generate synthetic images using ControlNet with configurable conditioning inputs.")
 
     parser.add_argument(
         "--config_yaml_path",
@@ -39,6 +39,12 @@ def parse_args():
         type=str,
         default="/mnt/hdd/pascalr/EM-ControlNet/data/EM-Dataset/train_masks",
         help="Path to the directory containing input mask images (e.g., train_masks)."
+    )
+    parser.add_argument(
+        "--edge_dir",
+        type=str,
+        default=None,
+        help="Path to the directory containing precomputed edge images."
     )
     parser.add_argument(
         "--output_base_dir",
@@ -93,40 +99,60 @@ def parse_args():
         action='store_true', # This will make guess_mode True if the flag is present
         help="Enable guess mode (less strict conditioning)."
     )
+    parser.add_argument(
+        "--condition_type",
+        type=str,
+        default="segmentation",
+        choices=["segmentation", "edge"],
+        help="Condition modality to feed into ControlNet."
+    )
 
     args = parser.parse_args()
     return args
 
 # --- Process Function ---
 def process(
-    batch_idx, img_idx, mask_path, prompt, a_prompt, n_prompt,
-    num_samples_per_inference, ddim_sampler, ddim_steps, guess_mode, strength, scale, seed, eta,
-    img_save_path, mask_save_path, model # Pass model to process
+    batch_idx,
+    img_idx,
+    condition_path,
+    prompt,
+    a_prompt,
+    n_prompt,
+    num_samples_per_inference,
+    ddim_sampler,
+    ddim_steps,
+    guess_mode,
+    strength,
+    scale,
+    seed,
+    eta,
+    img_save_path,
+    condition_save_path,
+    model,
+    condition_type,
+    num_segmentation_classes=3,
 ):
-    """
-    Processes a single mask to generate synthetic images using ControlNet.
-    """
+    """Generate samples conditioned on a segmentation mask or precomputed edge map."""
     with torch.no_grad():
-        raw_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE) # Read as grayscale
-        if raw_mask is None:
-            print(f"Error: Could not read mask image at {mask_path}. Skipping.")
+        condition_gray = cv2.imread(condition_path, cv2.IMREAD_GRAYSCALE)
+        if condition_gray is None:
+            print(f"Error: Could not read condition image at {condition_path}. Skipping.")
             return []
 
-        # Ensure raw_mask is 2D (H, W) for class mapping, then create RGB
-        if raw_mask.ndim == 3: # If somehow read as 3 channel, take first one
-            raw_mask = raw_mask[:, :, 0]
+        if condition_gray.ndim == 3:
+            condition_gray = condition_gray[:, :, 0]
 
-        H, W = raw_mask.shape
-        rgb_mask = np.zeros((H, W, 3), dtype=np.uint8)
+        if condition_type == "segmentation":
+            H, W = condition_gray.shape
+            rgb_condition = np.zeros((H, W, 3), dtype=np.uint8)
+            for class_idx in range(num_segmentation_classes):
+                rgb_condition[:, :, class_idx] = (condition_gray == class_idx).astype(np.uint8) * 255
+        elif condition_type == "edge":
+            rgb_condition = cv2.cvtColor(condition_gray, cv2.COLOR_GRAY2RGB)
+        else:
+            raise ValueError(f"Unsupported condition_type: {condition_type}")
 
-        # Assuming raw_mask contains pixel values representing class_idx (0, 1, 2 for 3 classes)
-        # Class 0 -> Red, Class 1 -> Green, Class 2 -> Blue
-        # This encoding maps distinct pixel values to distinct RGB channels.
-        # If your classes are 1, 2, 3, adjust `raw_mask == class_idx` accordingly.
-        for class_idx in range(3): # Iterate for 3 classes
-            rgb_mask[:, :, class_idx] = (raw_mask == class_idx).astype(np.uint8) * 255
-
-        control = torch.from_numpy(rgb_mask.copy()).float().cuda() / 255.0
+        control = torch.from_numpy(rgb_condition.copy()).float().cuda() / 255.0
         control = torch.stack([control for _ in range(num_samples_per_inference)], dim=0)
         control = einops.rearrange(control, 'b h w c -> b c h w').clone()
         H_control, W_control = control.shape[-2:]
@@ -161,22 +187,22 @@ def process(
 
         # Create output directories if they don't exist
         os.makedirs(img_save_path, exist_ok=True)
-        os.makedirs(mask_save_path, exist_ok=True)
+        os.makedirs(condition_save_path, exist_ok=True)
 
 
         for i in range(num_samples_per_inference):
-            output_img_filename = f'image_mask{img_idx}_batch{batch_idx}_sample{i}.png'
-            # Save the *original* single-channel mask used for this generation
-            output_mask_filename = f'mask_mask{img_idx}_batch{batch_idx}_sample{i}.png'
+            output_img_filename = f'image_cond{img_idx}_batch{batch_idx}_sample{i}.png'
+            # Save the *original* single-channel condition used for this generation
+            output_condition_filename = f'condition_cond{img_idx}_batch{batch_idx}_sample{i}.png'
 
             img_result_path = os.path.join(img_save_path, output_img_filename)
-            mask_result_path = os.path.join(mask_save_path, output_mask_filename)
+            condition_result_path = os.path.join(condition_save_path, output_condition_filename)
 
             cv2.imwrite(img_result_path, cv2.cvtColor(x_samples[i], cv2.COLOR_RGB2BGR))
             print(f'{output_img_filename} has the prompt "{prompt}"')
 
-            # Save the raw_mask (single channel) that corresponds to the generated image
-            cv2.imwrite(mask_result_path, raw_mask) # raw_mask is (H, W) for class indices
+            # Save the gray condition map that corresponds to the generated image
+            cv2.imwrite(condition_result_path, condition_gray)
 
         # results is a list of generated images (numpy arrays)
         # The original code returned [rgb_mask] + results, but rgb_mask is the input, not output
@@ -184,11 +210,11 @@ def process(
         return [x_samples[i] for i in range(num_samples_per_inference)]
 
 
-def save_generation_state(args, mask_paths, run_output_dir, filename='generate_state.json'):
+def save_generation_state(args, condition_paths, run_output_dir, filename='generate_state.json'):
     """
     Save the generation 'situation' to a JSON file. This includes:
     - the parsed `args` (as a dict)
-    - the list of mask paths that will be processed
+    - the list of condition image paths that will be processed
     - a small set of simple values from the `config` module
 
     The file is written to `<run_output_dir>/<filename>` and the
@@ -205,8 +231,10 @@ def save_generation_state(args, mask_paths, run_output_dir, filename='generate_s
         except Exception:
             state['args'] = str(args)
 
-    # mask paths
-    state['mask_paths'] = list(mask_paths)
+    # condition paths (retain legacy key for backward compatibility)
+    condition_list = list(condition_paths)
+    state['condition_paths'] = condition_list
+    state['mask_paths'] = condition_list
 
     # capture simple config values (str/int/float/bool/list/dict/None)
     cfg = {}
@@ -257,9 +285,18 @@ def main():
     model = model.cuda()
     ddim_sampler = DDIMSampler(model)
 
-    # --- Prepare Mask Paths ---
-    mask_paths = [os.path.join(args.mask_dir, file) for file in os.listdir(args.mask_dir) if file.endswith(".png")]
-    mask_paths.sort() # Ensure consistent order
+    # --- Prepare Condition Paths ---
+    if args.condition_type == "segmentation":
+        if args.mask_dir is None:
+            raise ValueError("--mask_dir must be specified when condition_type is 'segmentation'.")
+        condition_dir = args.mask_dir
+    else:
+        if args.edge_dir is None:
+            raise ValueError("--edge_dir must be specified when condition_type is 'edge'.")
+        condition_dir = args.edge_dir
+
+    condition_paths = [os.path.join(condition_dir, file) for file in os.listdir(condition_dir) if file.endswith(".png")]
+    condition_paths.sort() # Ensure consistent order
 
     prompts = [
         "A realistic scientific image of a cell taken from an electron microscope, photorealistic style, very detailed, black, white, detail",
@@ -305,43 +342,43 @@ def main():
     timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_output_dir = os.path.join(args.output_base_dir, f"run_{timestamp_str}")
     os.makedirs(run_output_dir, exist_ok=True)
-    # Save the generation state (args, mask list, small config snapshot)
+    # Save the generation state (args, condition list, small config snapshot)
     try:
-        save_generation_state(args, mask_paths, run_output_dir)
+        save_generation_state(args, condition_paths, run_output_dir)
     except Exception as e:
         print(f"Warning: failed to save generation state: {e}")
 
     img_save_path_base = os.path.join(run_output_dir, "images")
-    mask_save_path_base = os.path.join(run_output_dir, "masks")
+    condition_save_path_base = os.path.join(run_output_dir, "conditions")
 
     print(f"Saving generated images to: {img_save_path_base}")
-    print(f"Saving corresponding masks to: {mask_save_path_base}")
-    print(f"Total masks to process: {len(mask_paths)}")
+    print(f"Saving corresponding condition maps to: {condition_save_path_base}")
+    print(f"Total condition maps to process: {len(condition_paths)}")
 
-    for img_idx, mask_path in enumerate(mask_paths):
-        print(f"\n--- Processing mask {img_idx + 1}/{len(mask_paths)}: {os.path.basename(mask_path)} ---")
+    for img_idx, condition_path in enumerate(condition_paths):
+        print(f"\n--- Processing condition {img_idx + 1}/{len(condition_paths)}: {os.path.basename(condition_path)} ---")
 
-        i = 0 # Counter for augmentations generated for the current mask
-        batch_count_for_mask = 0 # Counter for inference batches for the current mask
+        i = 0 # Counter for augmentations generated for the current condition map
+        batch_count_for_condition = 0 # Counter for inference batches for the current condition map
 
         while i < args.n_augmentations_per_mask:
             # Determine how many samples to generate in the current inference call
             current_num_samples_to_generate = min(args.batch_size_per_inference, args.n_augmentations_per_mask - i)
 
             if current_num_samples_to_generate <= 0:
-                break # No more augmentations needed for this mask
+                break # No more augmentations needed for this condition map
 
             i += current_num_samples_to_generate
-            batch_count_for_mask += 1
+            batch_count_for_condition += 1
 
             prompt = np.random.choice(prompts) # Random prompt for each batch
             a_prompt = ""
             n_prompt = ""
 
             results = process(
-                batch_idx=batch_count_for_mask, # Pass current batch index for this mask
+                batch_idx=batch_count_for_condition, # Pass current batch index for this condition map
                 img_idx=img_idx,
-                mask_path=mask_path,
+                condition_path=condition_path,
                 prompt=prompt,
                 a_prompt=a_prompt,
                 n_prompt=n_prompt,
@@ -354,11 +391,12 @@ def main():
                 seed=args.seed,
                 eta=args.eta,
                 img_save_path=img_save_path_base,
-                mask_save_path=mask_save_path_base,
-                model=model # Pass the model object
+                condition_save_path=condition_save_path_base,
+                model=model,
+                condition_type=args.condition_type,
             )
 
-            print(f"Generated {current_num_samples_to_generate} images for {os.path.basename(mask_path)} (Batch {batch_count_for_mask})")
+            print(f"Generated {current_num_samples_to_generate} images for {os.path.basename(condition_path)} (Batch {batch_count_for_condition})")
 
     print("\n--- All synthetic images generated! ---")
 
