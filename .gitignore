@@ -150,8 +150,8 @@ data/*
 
 
 *.sqsh
-/models*
-/wandb/*
-/logs/*
-/my_synth_data/*
-/scripts/*
+models*
+wandb/*
+logs/*
+my_synth_data/*
+scripts/*
