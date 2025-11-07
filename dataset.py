@@ -1,14 +1,12 @@
-import json
+import os
 import cv2
 import numpy as np
 import glob
-from PIL import Image
 
 from torch.utils.data import Dataset
 # from torchvision import transforms
 import torchvision.transforms.v2 as transforms
 import re
-import random
 
 def is_image_not_augmented(filename):
     # pattern = re.compile(r'^image_\d+\.png$')
@@ -16,11 +14,26 @@ def is_image_not_augmented(filename):
     return bool(pattern.match(filename))
 
 class MyDataset(Dataset):
-    def __init__(self, imagePaths, maskPaths, augment=True):
-        self.imagePaths = sorted(glob.glob(imagePaths+"/*.png"))
-        self.maskPaths = sorted(glob.glob(maskPaths+"/*.png"))
+    def __init__(self, image_dir, condition_dir, augment=True, condition_type="segmentation"):
+        if image_dir is None:
+            raise ValueError("image_dir must be provided.")
+        if condition_dir is None:
+            raise ValueError("condition_dir must be provided.")
 
-        print("Using EM-Dataset number images" + str(len(self.imagePaths)))
+        self.imagePaths = sorted(glob.glob(os.path.join(image_dir, "*.png")))
+        self.conditionPaths = sorted(glob.glob(os.path.join(condition_dir, "*.png")))
+        self.condition_type = condition_type
+
+        if len(self.imagePaths) == 0:
+            raise ValueError(f"No training images found in {image_dir}.")
+        if len(self.conditionPaths) == 0:
+            raise ValueError(f"No condition images found in {condition_dir}.")
+        if len(self.imagePaths) != len(self.conditionPaths):
+            raise ValueError(
+                f"Image count ({len(self.imagePaths)}) and condition count ({len(self.conditionPaths)}) differ."
+            )
+
+        print(f"Using {len(self.imagePaths)} samples with condition type '{self.condition_type}'.")
 
         if augment:
             self.transforms = transforms.Compose([
@@ -92,13 +105,23 @@ class MyDataset(Dataset):
     def __getitem__(self, idx):
         # item = self.data[idx]
         imagePath = self.imagePaths[idx]
-        maskPath = self.maskPaths[idx]
+        conditionPath = self.conditionPaths[idx]
 
-        source = cv2.imread(maskPath)[:,:,0] # 512,512,3 ; max = 255 min = 0
-        rgb_source = np.zeros((source.shape[0], source.shape[1], 3), dtype=np.uint8)
-        for class_idx in range(3):
-            rgb_source[:,:,class_idx] = (source==class_idx).astype(np.uint8)*255
-        source = rgb_source
+        if self.condition_type == "segmentation":
+            mask = cv2.imread(conditionPath, cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                raise FileNotFoundError(f"Failed to read segmentation mask: {conditionPath}")
+            rgb_source = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
+            for class_idx in range(3):
+                rgb_source[:, :, class_idx] = (mask == class_idx).astype(np.uint8) * 255
+            source = rgb_source
+        elif self.condition_type == "edge":
+            edge = cv2.imread(conditionPath, cv2.IMREAD_GRAYSCALE)
+            if edge is None:
+                raise FileNotFoundError(f"Failed to read edge image: {conditionPath}")
+            source = cv2.cvtColor(edge, cv2.COLOR_GRAY2RGB)
+        else:
+            raise ValueError(f"Unsupported condition_type: {self.condition_type}")
 
         target = cv2.imread(imagePath) # 512,512,3 ; max = 244 min = 0
 
