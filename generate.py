@@ -8,15 +8,125 @@ import einops
 # import gradio as gr
 import numpy as np
 import torch
+import torch.nn as nn
 import random
 import datetime
 import argparse # Import argparse
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from pytorch_lightning import seed_everything
 from annotator.util import resize_image, HWC3
 from annotator.uniformer import UniformerDetector
 from cldm.model import create_model, load_state_dict
 from cldm.ddim_hacked import DDIMSampler
+
+DEFAULT_EDGE_KEY = "edge"
+
+
+@dataclass(frozen=True)
+class ConditionDefinition:
+    key: str
+    modality: str
+    display_name: str
+    channels: int = 3
+
+
+class MultiConditionControlNet(nn.Module):
+    """Aggregates multiple ControlNet branches following the official ControlNet multi-conditioning design."""
+
+    def __init__(
+        self,
+        modules: Sequence[nn.Module],
+        channel_splits: Sequence[int],
+        condition_keys: Sequence[str],
+        per_condition_scales: Optional[Sequence[float]] = None,
+    ) -> None:
+        super().__init__()
+        if not (len(modules) == len(channel_splits) == len(condition_keys)):
+            raise ValueError("modules, channel_splits, and condition_keys must have the same length")
+
+        self.control_modules = nn.ModuleList(modules)
+        self.channel_splits = list(channel_splits)
+        self.condition_keys = list(condition_keys)
+
+        if per_condition_scales is None:
+            self.per_condition_scales = [1.0] * len(self.control_modules)
+        else:
+            if len(per_condition_scales) != len(self.control_modules):
+                raise ValueError("per_condition_scales must have the same length as modules")
+            self.per_condition_scales = list(per_condition_scales)
+
+    def forward(self, x, hint, timesteps, context, **kwargs):
+        if hint is None:
+            raise ValueError("hint tensor must not be None when using MultiConditionControlNet")
+
+        hint_splits = torch.split(hint, self.channel_splits, dim=1)
+        if len(hint_splits) != len(self.control_modules):
+            raise ValueError(
+                f"Expected {len(self.control_modules)} hint splits but received {len(hint_splits)}"
+            )
+
+        aggregated_control = None
+        for module, hint_chunk, strength in zip(self.control_modules, hint_splits, self.per_condition_scales):
+            control_outputs = module(x=x, hint=hint_chunk, timesteps=timesteps, context=context, **kwargs)
+            if strength != 1.0:
+                control_outputs = [c * strength for c in control_outputs]
+
+            if aggregated_control is None:
+                aggregated_control = [c.clone() for c in control_outputs]
+            else:
+                aggregated_control = [acc + cur for acc, cur in zip(aggregated_control, control_outputs)]
+
+        return aggregated_control
+
+    def set_condition_scale(self, key: str, value: float) -> None:
+        try:
+            idx = self.condition_keys.index(key)
+        except ValueError as exc:
+            raise KeyError(f"Condition key '{key}' not registered in MultiConditionControlNet") from exc
+        self.per_condition_scales[idx] = float(value)
+
+    def get_condition_scales(self) -> Dict[str, float]:
+        return {key: scale for key, scale in zip(self.condition_keys, self.per_condition_scales)}
+
+
+def freeze_module(module: nn.Module) -> None:
+    for param in module.parameters():
+        param.requires_grad_(False)
+
+
+def parse_key_value_pairs(items: Sequence[str], flag_name: str) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for raw in items:
+        if "=" not in raw:
+            raise ValueError(f"Entries for {flag_name} must be in the format '<name>=<path>', got: {raw}")
+        name, value = raw.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name or not value:
+            raise ValueError(f"Invalid entry for {flag_name}: '{raw}'")
+        if name in result:
+            raise ValueError(f"Duplicate key '{name}' encountered in {flag_name}")
+        result[name] = value
+    return result
+
+
+def parse_strength_pairs(items: Sequence[str], flag_name: str) -> Dict[str, float]:
+    strength_map: Dict[str, float] = {}
+    for raw in items:
+        if "=" not in raw:
+            raise ValueError(f"Entries for {flag_name} must be in the format '<name>=<float>', got: {raw}")
+        name, value = raw.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name or not value:
+            raise ValueError(f"Invalid entry for {flag_name}: '{raw}'")
+        try:
+            strength_map[name] = float(value)
+        except ValueError as exc:
+            raise ValueError(f"Strength value for '{name}' in {flag_name} must be a float, got '{value}'") from exc
+    return strength_map
 
 # --- Argument Parsing ---
 def parse_args():
@@ -35,6 +145,25 @@ def parse_args():
         help="Path to the ControlNet model weights checkpoint (.ckpt) file."
     )
     parser.add_argument(
+        "--mask_model_path",
+        type=str,
+        default=None,
+        help="Path to the ControlNet checkpoint fine-tuned for mask conditioning. Defaults to --model_weights_path if omitted."
+    )
+    parser.add_argument(
+        "--edge_model_path",
+        type=str,
+        default=None,
+        help="Optional single edge ControlNet checkpoint (deprecated, use --edge_model_paths)."
+    )
+    parser.add_argument(
+        "--edge_model_paths",
+        type=str,
+        nargs='+',
+        default=[],
+        help="Edge ControlNet checkpoints defined as '<name>=/path/to/model.ckpt'."
+    )
+    parser.add_argument(
         "--mask_dir",
         type=str,
         default="/mnt/hdd/pascalr/EM-ControlNet/data/EM-Dataset/train_masks",
@@ -47,9 +176,16 @@ def parse_args():
         help="Path to the directory containing precomputed edge images."
     )
     parser.add_argument(
+        "--edge_dirs",
+        type=str,
+        nargs='+',
+        default=[],
+        help="Edge image directories defined as '<name>=/path/to/edges'. Names must match --edge_model_paths entries."
+    )
+    parser.add_argument(
         "--output_base_dir",
         type=str,
-        default="generated_images",
+        default="my_synth_data",
         help="Base directory to save generated images and masks. A timestamped folder will be created inside this for each run."
     )
     parser.add_argument(
@@ -106,111 +242,164 @@ def parse_args():
         choices=["segmentation", "edge"],
         help="Condition modality to feed into ControlNet."
     )
+    parser.add_argument(
+        "--mask_strength",
+        type=float,
+        default=None,
+        help="Optional relative strength applied to the mask ControlNet branch (defaults to 1.0)."
+    )
+    parser.add_argument(
+        "--edge_strengths",
+        type=str,
+        nargs='+',
+        default=[],
+        help="Optional relative strengths for edge ControlNet branches formatted as '<name>=<float>'."
+    )
+    parser.add_argument(
+        "--skip_missing_edges",
+        action='store_true',
+        help="If set, skip samples whose edge condition files are missing instead of raising an error."
+    )
 
     args = parser.parse_args()
     return args
 
 # --- Process Function ---
 def process(
-    batch_idx,
-    img_idx,
-    condition_path,
-    prompt,
-    a_prompt,
-    n_prompt,
-    num_samples_per_inference,
+    batch_idx: int,
+    img_idx: int,
+    condition_sample: Dict[str, str],
+    condition_definitions: Sequence[ConditionDefinition],
+    prompt: str,
+    a_prompt: str,
+    n_prompt: str,
+    num_samples_per_inference: int,
     ddim_sampler,
-    ddim_steps,
-    guess_mode,
-    strength,
-    scale,
-    seed,
-    eta,
-    img_save_path,
-    condition_save_path,
+    ddim_steps: int,
+    guess_mode: bool,
+    strength: float,
+    scale: float,
+    seed: int,
+    eta: float,
+    img_save_path: str,
+    condition_save_path: str,
     model,
-    condition_type,
-    num_segmentation_classes=3,
-):
-    """Generate samples conditioned on a segmentation mask or precomputed edge map."""
+    num_segmentation_classes: int = 3,
+) -> List[np.ndarray]:
+    """Generate samples conditioned on multiple modalities (mask + edges)."""
+
     with torch.no_grad():
-        condition_gray = cv2.imread(condition_path, cv2.IMREAD_GRAYSCALE)
-        if condition_gray is None:
-            print(f"Error: Could not read condition image at {condition_path}. Skipping.")
+        prepared_conditions: List[Tuple[ConditionDefinition, np.ndarray, np.ndarray]] = []
+        target_hw: Optional[Tuple[int, int]] = None
+
+        for definition in condition_definitions:
+            condition_path = condition_sample.get(definition.key)
+            if condition_path is None:
+                raise KeyError(f"Missing condition path for key '{definition.key}' in condition_sample")
+
+            condition_gray = cv2.imread(condition_path, cv2.IMREAD_GRAYSCALE)
+            if condition_gray is None:
+                print(f"Error: Could not read condition image at {condition_path}. Skipping.")
+                return []
+
+            if target_hw is None:
+                target_hw = condition_gray.shape[:2]
+            elif condition_gray.shape[:2] != target_hw:
+                interpolation = cv2.INTER_NEAREST if definition.modality == "segmentation" else cv2.INTER_LINEAR
+                condition_gray = cv2.resize(condition_gray, (target_hw[1], target_hw[0]), interpolation=interpolation)
+
+            if definition.modality == "segmentation":
+                H, W = condition_gray.shape
+                rgb_condition = np.zeros((H, W, definition.channels), dtype=np.uint8)
+                max_channel = min(definition.channels, num_segmentation_classes)
+                for class_idx in range(max_channel):
+                    rgb_condition[:, :, class_idx] = (condition_gray == class_idx).astype(np.uint8) * 255
+                if definition.channels > max_channel:
+                    # Fill any remaining channels with zeros to maintain expected width
+                    for channel_idx in range(max_channel, definition.channels):
+                        rgb_condition[:, :, channel_idx] = 0
+            elif definition.modality == "edge":
+                rgb_condition = cv2.cvtColor(condition_gray, cv2.COLOR_GRAY2RGB)
+            else:
+                raise ValueError(f"Unsupported condition modality: {definition.modality}")
+
+            prepared_conditions.append((definition, rgb_condition, condition_gray))
+
+        if not prepared_conditions:
+            print("Warning: No conditioning information prepared. Skipping batch.")
             return []
 
-        if condition_gray.ndim == 3:
-            condition_gray = condition_gray[:, :, 0]
+        control_tensors: List[torch.Tensor] = []
+        for _, rgb_condition, _ in prepared_conditions:
+            control = torch.from_numpy(rgb_condition.copy()).float().cuda() / 255.0
+            control = torch.stack([control for _ in range(num_samples_per_inference)], dim=0)
+            control = einops.rearrange(control, 'b h w c -> b c h w').clone()
+            control_tensors.append(control)
 
-        if condition_type == "segmentation":
-            H, W = condition_gray.shape
-            rgb_condition = np.zeros((H, W, 3), dtype=np.uint8)
-            for class_idx in range(num_segmentation_classes):
-                rgb_condition[:, :, class_idx] = (condition_gray == class_idx).astype(np.uint8) * 255
-        elif condition_type == "edge":
-            rgb_condition = cv2.cvtColor(condition_gray, cv2.COLOR_GRAY2RGB)
-        else:
-            raise ValueError(f"Unsupported condition_type: {condition_type}")
-
-        control = torch.from_numpy(rgb_condition.copy()).float().cuda() / 255.0
-        control = torch.stack([control for _ in range(num_samples_per_inference)], dim=0)
-        control = einops.rearrange(control, 'b h w c -> b c h w').clone()
-        H_control, W_control = control.shape[-2:]
+        combined_control = torch.cat(control_tensors, dim=1)
+        H_control, W_control = combined_control.shape[-2:]
 
         current_seed = seed
         if current_seed == -1:
             current_seed = random.randint(0, 65535)
         seed_everything(current_seed)
 
-        if config.save_memory: # Assuming 'config' module is still available and has save_memory
+        if config.save_memory:
             model.low_vram_shift(is_diffusing=False)
 
-        cond = {"c_concat": [control], "c_crossattn": [model.get_learned_conditioning([prompt + ', ' + a_prompt] * num_samples_per_inference)]}
-        un_cond = {"c_concat": None if guess_mode else [control], "c_crossattn": [model.get_learned_conditioning([n_prompt] * num_samples_per_inference)]}
+        cond = {
+            "c_concat": [combined_control],
+            "c_crossattn": [model.get_learned_conditioning([prompt + ', ' + a_prompt] * num_samples_per_inference)],
+        }
+        un_cond = {
+            "c_concat": None if guess_mode else [combined_control],
+            "c_crossattn": [model.get_learned_conditioning([n_prompt] * num_samples_per_inference)],
+        }
         shape = (4, H_control // 8, W_control // 8)
 
         if config.save_memory:
             model.low_vram_shift(is_diffusing=True)
 
-        # Apply control scales
         model.control_scales = [strength * (0.825 ** float(12 - i)) for i in range(13)] if guess_mode else ([strength] * 13)
-        samples, intermediates = ddim_sampler.sample(ddim_steps, num_samples_per_inference,
-                                                     shape, cond, verbose=False, eta=eta,
-                                                     unconditional_guidance_scale=scale,
-                                                     unconditional_conditioning=un_cond)
+        samples, intermediates = ddim_sampler.sample(
+            ddim_steps,
+            num_samples_per_inference,
+            shape,
+            cond,
+            verbose=False,
+            eta=eta,
+            unconditional_guidance_scale=scale,
+            unconditional_conditioning=un_cond,
+        )
 
         if config.save_memory:
             model.low_vram_shift(is_diffusing=False)
 
         x_samples = model.decode_first_stage(samples)
-        x_samples = (einops.rearrange(x_samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
+        x_samples = (
+            einops.rearrange(x_samples, 'b c h w -> b h w c') * 127.5 + 127.5
+        ).cpu().numpy().clip(0, 255).astype(np.uint8)
 
-        # Create output directories if they don't exist
         os.makedirs(img_save_path, exist_ok=True)
         os.makedirs(condition_save_path, exist_ok=True)
 
-
         for i in range(num_samples_per_inference):
             output_img_filename = f'image_cond{img_idx}_batch{batch_idx}_sample{i}.png'
-            # Save the *original* single-channel condition used for this generation
-            output_condition_filename = f'condition_cond{img_idx}_batch{batch_idx}_sample{i}.png'
-
             img_result_path = os.path.join(img_save_path, output_img_filename)
-            condition_result_path = os.path.join(condition_save_path, output_condition_filename)
-
             cv2.imwrite(img_result_path, cv2.cvtColor(x_samples[i], cv2.COLOR_RGB2BGR))
             print(f'{output_img_filename} has the prompt "{prompt}"')
 
-            # Save the gray condition map that corresponds to the generated image
-            cv2.imwrite(condition_result_path, condition_gray)
+            for definition, _, condition_gray in prepared_conditions:
+                condition_dir = os.path.join(condition_save_path, definition.key)
+                os.makedirs(condition_dir, exist_ok=True)
+                condition_filename = f'{definition.key}_cond{img_idx}_batch{batch_idx}_sample{i}.png'
+                condition_result_path = os.path.join(condition_dir, condition_filename)
+                cv2.imwrite(condition_result_path, condition_gray)
 
-        # results is a list of generated images (numpy arrays)
-        # The original code returned [rgb_mask] + results, but rgb_mask is the input, not output
-        # Usually, `results` for generative tasks refers to the generated samples.
         return [x_samples[i] for i in range(num_samples_per_inference)]
 
 
-def save_generation_state(args, condition_paths, run_output_dir, filename='generate_state.json'):
+def save_generation_state(args, condition_paths, run_output_dir, filename='generate_state.json', condition_records: Optional[Sequence[Dict[str, str]]] = None):
     """
     Save the generation 'situation' to a JSON file. This includes:
     - the parsed `args` (as a dict)
@@ -235,6 +424,8 @@ def save_generation_state(args, condition_paths, run_output_dir, filename='gener
     condition_list = list(condition_paths)
     state['condition_paths'] = condition_list
     state['mask_paths'] = condition_list
+    if condition_records is not None:
+        state['condition_records'] = [dict(record) for record in condition_records]
 
     # capture simple config values (str/int/float/bool/list/dict/None)
     cfg = {}
@@ -279,24 +470,121 @@ def load_generation_state(filepath):
 def main():
     args = parse_args()
 
-    # --- Initialize Model (using args) ---
+    if args.condition_type and args.condition_type != "segmentation":
+        print("Warning: --condition_type is deprecated for generation; using mask plus optional edge conditions.")
+
+    mask_model_path = args.mask_model_path or args.model_weights_path
+    if mask_model_path is None:
+        raise ValueError("Either --mask_model_path or --model_weights_path must be specified for mask conditioning.")
+    mask_model_path = os.path.abspath(mask_model_path)
+    if not os.path.isfile(mask_model_path):
+        raise FileNotFoundError(f"Mask ControlNet checkpoint not found: {mask_model_path}")
+
+    if args.mask_dir is None:
+        raise ValueError("--mask_dir must be specified for mask conditioning.")
+    mask_dir = os.path.abspath(args.mask_dir)
+    if not os.path.isdir(mask_dir):
+        raise FileNotFoundError(f"Mask directory not found: {mask_dir}")
+
+    edge_model_specs = parse_key_value_pairs(args.edge_model_paths, "--edge_model_paths") if args.edge_model_paths else {}
+    if args.edge_model_path:
+        edge_model_specs.setdefault(DEFAULT_EDGE_KEY, args.edge_model_path)
+    edge_dir_specs = parse_key_value_pairs(args.edge_dirs, "--edge_dirs") if args.edge_dirs else {}
+    if args.edge_dir:
+        edge_dir_specs.setdefault(DEFAULT_EDGE_KEY, args.edge_dir)
+
+    if edge_model_specs and not edge_dir_specs:
+        raise ValueError("Edge image directories must be provided via --edge_dirs/--edge_dir when edge models are specified.")
+    if edge_dir_specs and not edge_model_specs:
+        raise ValueError("Edge model checkpoints must be provided via --edge_model_paths/--edge_model_path when edge directories are specified.")
+
+    if set(edge_model_specs.keys()) != set(edge_dir_specs.keys()):
+        raise ValueError("--edge_model_paths and --edge_dirs must refer to the same condition names.")
+
+    edge_dir_specs = {name: os.path.abspath(path) for name, path in edge_dir_specs.items()}
+    for name, path in edge_dir_specs.items():
+        if not os.path.isdir(path):
+            raise FileNotFoundError(f"Edge directory for '{name}' not found: {path}")
+
+    edge_order = list(edge_model_specs.keys())
+    edge_strength_map = parse_strength_pairs(args.edge_strengths, "--edge_strengths") if args.edge_strengths else {}
+
+    # --- Initialize Model with multi-branch control ---
     model = create_model(args.config_yaml_path).cpu()
-    model.load_state_dict(load_state_dict(args.model_weights_path, location='cuda'), strict=False) # Load to CUDA
+    model.load_state_dict(load_state_dict(mask_model_path, location='cpu'), strict=False)
+
+    mask_control = model.control_model
+    freeze_module(mask_control)
+    mask_control.eval()
+
+    condition_definitions: List[ConditionDefinition] = [
+        ConditionDefinition(key="mask", modality="segmentation", display_name="mask", channels=3)
+    ]
+    control_modules: List[nn.Module] = [mask_control]
+    condition_strengths: List[float] = [args.mask_strength if args.mask_strength is not None else 1.0]
+
+    for edge_key in edge_order:
+        edge_model_path = os.path.abspath(edge_model_specs[edge_key])
+        if not os.path.isfile(edge_model_path):
+            raise FileNotFoundError(f"Edge ControlNet checkpoint for '{edge_key}' not found: {edge_model_path}")
+
+        edge_model = create_model(args.config_yaml_path).cpu()
+        edge_model.load_state_dict(load_state_dict(edge_model_path, location='cpu'), strict=False)
+        edge_control = edge_model.control_model
+        freeze_module(edge_control)
+        edge_control.eval()
+        control_modules.append(edge_control)
+        condition_definitions.append(
+            ConditionDefinition(key=edge_key, modality="edge", display_name=edge_key, channels=3)
+        )
+        condition_strengths.append(edge_strength_map.get(edge_key, 1.0))
+        del edge_model
+
+    multi_control_model = MultiConditionControlNet(
+        modules=control_modules,
+        channel_splits=[definition.channels for definition in condition_definitions],
+        condition_keys=[definition.key for definition in condition_definitions],
+        per_condition_scales=condition_strengths,
+    )
+    model.control_model = multi_control_model
     model = model.cuda()
     ddim_sampler = DDIMSampler(model)
 
-    # --- Prepare Condition Paths ---
-    if args.condition_type == "segmentation":
-        if args.mask_dir is None:
-            raise ValueError("--mask_dir must be specified when condition_type is 'segmentation'.")
-        condition_dir = args.mask_dir
-    else:
-        if args.edge_dir is None:
-            raise ValueError("--edge_dir must be specified when condition_type is 'edge'.")
-        condition_dir = args.edge_dir
+    condition_scale_map = multi_control_model.get_condition_scales()
+    condition_branches = ", ".join(
+        f"{definition.key}(strength={condition_scale_map[definition.key]:.2f})"
+        for definition in condition_definitions
+    )
+    print(f"Configured condition branches: {condition_branches}")
 
-    condition_paths = [os.path.join(condition_dir, file) for file in os.listdir(condition_dir) if file.endswith(".png")]
-    condition_paths.sort() # Ensure consistent order
+    mask_paths = [os.path.join(mask_dir, file) for file in os.listdir(mask_dir) if file.lower().endswith('.png')]
+    mask_paths.sort()
+    if not mask_paths:
+        raise ValueError(f"No mask images found in {mask_dir}")
+
+    condition_samples: List[Dict[str, str]] = []
+    mask_key = condition_definitions[0].key
+    for mask_path in mask_paths:
+        record: Dict[str, str] = {mask_key: mask_path}
+        mask_name = os.path.basename(mask_path)
+        missing_edge = False
+        for edge_key in edge_order:
+            edge_candidate = os.path.join(edge_dir_specs[edge_key], mask_name)
+            if not os.path.isfile(edge_candidate):
+                message = f"Missing edge file for '{edge_key}' corresponding to mask {mask_name}: {edge_candidate}"
+                if args.skip_missing_edges:
+                    print(f"Warning: {message}. Skipping this sample.")
+                    missing_edge = True
+                    break
+                raise FileNotFoundError(message)
+            record[edge_key] = edge_candidate
+        if missing_edge:
+            continue
+        condition_samples.append(record)
+
+    if not condition_samples:
+        print("No valid condition samples found after applying edge requirements. Nothing to generate.")
+        return
 
     prompts = [
         "A realistic scientific image of a cell taken from an electron microscope, photorealistic style, very detailed, black, white, detail",
@@ -338,47 +626,53 @@ def main():
         "Intricate black-and-white composition showcasing the elegance of cellular architecture, with a focus on fine details and contours",
     ]
 
-    # Get current timestamp for the entire run's output folder
     timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_output_dir = os.path.join(args.output_base_dir, f"run_{timestamp_str}")
     os.makedirs(run_output_dir, exist_ok=True)
-    # Save the generation state (args, condition list, small config snapshot)
+
+    mask_path_list = [record[mask_key] for record in condition_samples]
     try:
-        save_generation_state(args, condition_paths, run_output_dir)
-    except Exception as e:
-        print(f"Warning: failed to save generation state: {e}")
+        save_generation_state(args, mask_path_list, run_output_dir, condition_records=condition_samples)
+    except Exception as exc:
+        print(f"Warning: failed to save generation state: {exc}")
 
     img_save_path_base = os.path.join(run_output_dir, "images")
     condition_save_path_base = os.path.join(run_output_dir, "conditions")
 
     print(f"Saving generated images to: {img_save_path_base}")
     print(f"Saving corresponding condition maps to: {condition_save_path_base}")
-    print(f"Total condition maps to process: {len(condition_paths)}")
+    print(f"Total condition sets to process: {len(condition_samples)}")
 
-    for img_idx, condition_path in enumerate(condition_paths):
-        print(f"\n--- Processing condition {img_idx + 1}/{len(condition_paths)}: {os.path.basename(condition_path)} ---")
+    for img_idx, condition_record in enumerate(condition_samples):
+        condition_details = ", ".join(
+            f"{definition.key}:{os.path.basename(condition_record.get(definition.key, ''))}"
+            for definition in condition_definitions
+        )
+        print(f"\n--- Processing condition {img_idx + 1}/{len(condition_samples)}: {condition_details} ---")
 
-        i = 0 # Counter for augmentations generated for the current condition map
-        batch_count_for_condition = 0 # Counter for inference batches for the current condition map
+        generated_so_far = 0
+        batch_count_for_condition = 0
 
-        while i < args.n_augmentations_per_mask:
-            # Determine how many samples to generate in the current inference call
-            current_num_samples_to_generate = min(args.batch_size_per_inference, args.n_augmentations_per_mask - i)
-
+        while generated_so_far < args.n_augmentations_per_mask:
+            current_num_samples_to_generate = min(
+                args.batch_size_per_inference,
+                args.n_augmentations_per_mask - generated_so_far,
+            )
             if current_num_samples_to_generate <= 0:
-                break # No more augmentations needed for this condition map
+                break
 
-            i += current_num_samples_to_generate
+            generated_so_far += current_num_samples_to_generate
             batch_count_for_condition += 1
 
-            prompt = np.random.choice(prompts) # Random prompt for each batch
+            prompt = np.random.choice(prompts)
             a_prompt = ""
             n_prompt = ""
 
-            results = process(
-                batch_idx=batch_count_for_condition, # Pass current batch index for this condition map
+            process(
+                batch_idx=batch_count_for_condition,
                 img_idx=img_idx,
-                condition_path=condition_path,
+                condition_sample=condition_record,
+                condition_definitions=condition_definitions,
                 prompt=prompt,
                 a_prompt=a_prompt,
                 n_prompt=n_prompt,
@@ -393,12 +687,14 @@ def main():
                 img_save_path=img_save_path_base,
                 condition_save_path=condition_save_path_base,
                 model=model,
-                condition_type=args.condition_type,
             )
 
-            print(f"Generated {current_num_samples_to_generate} images for {os.path.basename(condition_path)} (Batch {batch_count_for_condition})")
+            print(
+                f"Generated {current_num_samples_to_generate} images for set {img_idx + 1} (Batch {batch_count_for_condition})"
+            )
 
     print("\n--- All synthetic images generated! ---")
+
 
 if __name__ == "__main__":
     main()
