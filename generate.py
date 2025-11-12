@@ -8,14 +8,12 @@ import einops
 # import gradio as gr
 import numpy as np
 import torch
-import torch.nn as nn
 import random
 import datetime
 import argparse # Import argparse
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from pytorch_lightning import seed_everything
 from annotator.util import resize_image, HWC3
 from annotator.uniformer import UniformerDetector
 from cldm.model import create_model, load_state_dict
@@ -32,12 +30,12 @@ class ConditionDefinition:
     channels: int = 3
 
 
-class MultiConditionControlNet(nn.Module):
+class MultiConditionControlNet(torch.nn.Module):
     """Aggregates multiple ControlNet branches following the official ControlNet multi-conditioning design."""
 
     def __init__(
         self,
-        modules: Sequence[nn.Module],
+        modules: Sequence[torch.nn.Module],
         channel_splits: Sequence[int],
         condition_keys: Sequence[str],
         per_condition_scales: Optional[Sequence[float]] = None,
@@ -46,7 +44,7 @@ class MultiConditionControlNet(nn.Module):
         if not (len(modules) == len(channel_splits) == len(condition_keys)):
             raise ValueError("modules, channel_splits, and condition_keys must have the same length")
 
-        self.control_modules = nn.ModuleList(modules)
+        self.control_modules = torch.nn.ModuleList(modules)
         self.channel_splits = list(channel_splits)
         self.condition_keys = list(condition_keys)
 
@@ -91,7 +89,7 @@ class MultiConditionControlNet(nn.Module):
         return {key: scale for key, scale in zip(self.condition_keys, self.per_condition_scales)}
 
 
-def freeze_module(module: nn.Module) -> None:
+def freeze_module(module: torch.nn.Module) -> None:
     for param in module.parameters():
         param.requires_grad_(False)
 
@@ -127,6 +125,14 @@ def parse_strength_pairs(items: Sequence[str], flag_name: str) -> Dict[str, floa
         except ValueError as exc:
             raise ValueError(f"Strength value for '{name}' in {flag_name} must be a float, got '{value}'") from exc
     return strength_map
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 # --- Argument Parsing ---
 def parse_args():
@@ -241,6 +247,13 @@ def parse_args():
         default="segmentation",
         choices=["segmentation", "edge"],
         help="Condition modality to feed into ControlNet."
+    )
+    parser.add_argument(
+        "--generation_mode",
+        type=str,
+        default="mask_and_edge",
+        choices=["mask_only", "edge_only", "mask_and_edge"],
+        help="Select which condition branches to use during generation."
     )
     parser.add_argument(
         "--mask_strength",
@@ -399,7 +412,14 @@ def process(
         return [x_samples[i] for i in range(num_samples_per_inference)]
 
 
-def save_generation_state(args, condition_paths, run_output_dir, filename='generate_state.json', condition_records: Optional[Sequence[Dict[str, str]]] = None):
+def save_generation_state(
+    args,
+    condition_paths,
+    run_output_dir,
+    filename='generate_state.json',
+    condition_records: Optional[Sequence[Dict[str, str]]] = None,
+    primary_condition_key: Optional[str] = None,
+):
     """
     Save the generation 'situation' to a JSON file. This includes:
     - the parsed `args` (as a dict)
@@ -423,7 +443,15 @@ def save_generation_state(args, condition_paths, run_output_dir, filename='gener
     # condition paths (retain legacy key for backward compatibility)
     condition_list = list(condition_paths)
     state['condition_paths'] = condition_list
-    state['mask_paths'] = condition_list
+    if primary_condition_key is not None:
+        state['primary_condition_key'] = primary_condition_key
+
+    mask_paths: List[str] = []
+    if condition_records:
+        mask_paths = [record['mask'] for record in condition_records if 'mask' in record]
+    elif primary_condition_key == 'mask':
+        mask_paths = condition_list
+    state['mask_paths'] = mask_paths
     if condition_records is not None:
         state['condition_records'] = [dict(record) for record in condition_records]
 
@@ -471,20 +499,14 @@ def main():
     args = parse_args()
 
     if args.condition_type and args.condition_type != "segmentation":
-        print("Warning: --condition_type is deprecated for generation; using mask plus optional edge conditions.")
+        print("Warning: --condition_type is deprecated; please rely on --generation_mode instead.")
 
-    mask_model_path = args.mask_model_path or args.model_weights_path
-    if mask_model_path is None:
-        raise ValueError("Either --mask_model_path or --model_weights_path must be specified for mask conditioning.")
-    mask_model_path = os.path.abspath(mask_model_path)
-    if not os.path.isfile(mask_model_path):
-        raise FileNotFoundError(f"Mask ControlNet checkpoint not found: {mask_model_path}")
+    generation_mode = args.generation_mode
+    use_mask = generation_mode in ("mask_only", "mask_and_edge")
+    use_edges = generation_mode in ("edge_only", "mask_and_edge")
 
-    if args.mask_dir is None:
-        raise ValueError("--mask_dir must be specified for mask conditioning.")
-    mask_dir = os.path.abspath(args.mask_dir)
-    if not os.path.isdir(mask_dir):
-        raise FileNotFoundError(f"Mask directory not found: {mask_dir}")
+    if not use_mask and args.mask_strength is not None:
+        print("Warning: --mask_strength specified but generation mode does not use mask conditioning; ignoring.")
 
     edge_model_specs = parse_key_value_pairs(args.edge_model_paths, "--edge_model_paths") if args.edge_model_paths else {}
     if args.edge_model_path:
@@ -493,52 +515,98 @@ def main():
     if args.edge_dir:
         edge_dir_specs.setdefault(DEFAULT_EDGE_KEY, args.edge_dir)
 
-    if edge_model_specs and not edge_dir_specs:
-        raise ValueError("Edge image directories must be provided via --edge_dirs/--edge_dir when edge models are specified.")
-    if edge_dir_specs and not edge_model_specs:
-        raise ValueError("Edge model checkpoints must be provided via --edge_model_paths/--edge_model_path when edge directories are specified.")
+    if not use_edges and (edge_model_specs or edge_dir_specs):
+        print("Warning: Edge-related arguments provided but generation mode does not use them; ignoring edge branches.")
+        edge_model_specs = {}
+        edge_dir_specs = {}
 
-    if set(edge_model_specs.keys()) != set(edge_dir_specs.keys()):
+    if use_edges and not edge_model_specs:
+        raise ValueError("At least one edge ControlNet checkpoint must be provided via --edge_model_paths/--edge_model_path when generation_mode requires edges.")
+    if use_edges and not edge_dir_specs:
+        raise ValueError("Edge image directories must be provided via --edge_dirs/--edge_dir when generation_mode requires edges.")
+    if use_edges and set(edge_model_specs.keys()) != set(edge_dir_specs.keys()):
         raise ValueError("--edge_model_paths and --edge_dirs must refer to the same condition names.")
 
-    edge_dir_specs = {name: os.path.abspath(path) for name, path in edge_dir_specs.items()}
-    for name, path in edge_dir_specs.items():
-        if not os.path.isdir(path):
-            raise FileNotFoundError(f"Edge directory for '{name}' not found: {path}")
+    edge_dir_specs = {name: os.path.abspath(path) for name, path in edge_dir_specs.items()} if edge_dir_specs else {}
+    if use_edges:
+        for name, path in edge_dir_specs.items():
+            if not os.path.isdir(path):
+                raise FileNotFoundError(f"Edge directory for '{name}' not found: {path}")
 
-    edge_order = list(edge_model_specs.keys())
+    mask_dir: Optional[str] = None
+    if use_mask:
+        if args.mask_dir is None:
+            raise ValueError("--mask_dir must be specified when mask conditioning is enabled.")
+        mask_dir = os.path.abspath(args.mask_dir)
+        if not os.path.isdir(mask_dir):
+            raise FileNotFoundError(f"Mask directory not found: {mask_dir}")
+    elif args.mask_dir is not None:
+        print("Warning: --mask_dir was provided but generation mode does not use masks; ignoring.")
+
+    base_model_path = args.model_weights_path or args.mask_model_path
+    if base_model_path is None:
+        raise ValueError("--model_weights_path must be provided to initialize the base ControlNet model.")
+    base_model_path = os.path.abspath(base_model_path)
+    if not os.path.isfile(base_model_path):
+        raise FileNotFoundError(f"Base ControlNet checkpoint not found: {base_model_path}")
+
     edge_strength_map = parse_strength_pairs(args.edge_strengths, "--edge_strengths") if args.edge_strengths else {}
+    if use_edges:
+        unused_strength_keys = set(edge_strength_map.keys()) - set(edge_model_specs.keys())
+        if unused_strength_keys:
+            print(
+                "Warning: --edge_strengths provided for unknown edge keys: "
+                + ", ".join(sorted(unused_strength_keys))
+            )
+    elif edge_strength_map:
+        print("Warning: --edge_strengths specified but generation mode does not use edges; ignoring.")
+        edge_strength_map = {}
 
-    # --- Initialize Model with multi-branch control ---
     model = create_model(args.config_yaml_path).cpu()
-    model.load_state_dict(load_state_dict(mask_model_path, location='cpu'), strict=False)
+    model.load_state_dict(load_state_dict(base_model_path, location='cpu'), strict=False)
 
-    mask_control = model.control_model
-    freeze_module(mask_control)
-    mask_control.eval()
+    condition_definitions: List[ConditionDefinition] = []
+    control_modules: List[torch.nn.Module] = []
+    condition_strengths: List[float] = []
 
-    condition_definitions: List[ConditionDefinition] = [
-        ConditionDefinition(key="mask", modality="segmentation", display_name="mask", channels=3)
-    ]
-    control_modules: List[nn.Module] = [mask_control]
-    condition_strengths: List[float] = [args.mask_strength if args.mask_strength is not None else 1.0]
-
-    for edge_key in edge_order:
-        edge_model_path = os.path.abspath(edge_model_specs[edge_key])
-        if not os.path.isfile(edge_model_path):
-            raise FileNotFoundError(f"Edge ControlNet checkpoint for '{edge_key}' not found: {edge_model_path}")
-
-        edge_model = create_model(args.config_yaml_path).cpu()
-        edge_model.load_state_dict(load_state_dict(edge_model_path, location='cpu'), strict=False)
-        edge_control = edge_model.control_model
-        freeze_module(edge_control)
-        edge_control.eval()
-        control_modules.append(edge_control)
+    if use_mask:
+        mask_model_path = args.mask_model_path or base_model_path
+        mask_model_path = os.path.abspath(mask_model_path)
+        if not os.path.isfile(mask_model_path):
+            raise FileNotFoundError(f"Mask ControlNet checkpoint not found: {mask_model_path}")
+        mask_model = create_model(args.config_yaml_path).cpu()
+        mask_model.load_state_dict(load_state_dict(mask_model_path, location='cpu'), strict=False)
+        mask_control = mask_model.control_model
+        freeze_module(mask_control)
+        mask_control.eval()
         condition_definitions.append(
-            ConditionDefinition(key=edge_key, modality="edge", display_name=edge_key, channels=3)
+            ConditionDefinition(key="mask", modality="segmentation", display_name="mask", channels=3)
         )
-        condition_strengths.append(edge_strength_map.get(edge_key, 1.0))
-        del edge_model
+        control_modules.append(mask_control)
+        condition_strengths.append(args.mask_strength if args.mask_strength is not None else 1.0)
+        del mask_model
+
+    edge_order: List[str] = []
+    if use_edges:
+        edge_order = list(edge_model_specs.keys())
+        for edge_key in edge_order:
+            edge_model_path = os.path.abspath(edge_model_specs[edge_key])
+            if not os.path.isfile(edge_model_path):
+                raise FileNotFoundError(f"Edge ControlNet checkpoint for '{edge_key}' not found: {edge_model_path}")
+            edge_model = create_model(args.config_yaml_path).cpu()
+            edge_model.load_state_dict(load_state_dict(edge_model_path, location='cpu'), strict=False)
+            edge_control = edge_model.control_model
+            freeze_module(edge_control)
+            edge_control.eval()
+            control_modules.append(edge_control)
+            condition_definitions.append(
+                ConditionDefinition(key=edge_key, modality="edge", display_name=edge_key, channels=3)
+            )
+            condition_strengths.append(edge_strength_map.get(edge_key, 1.0))
+            del edge_model
+
+    if not condition_definitions:
+        raise RuntimeError("No conditioning branches configured. Check --generation_mode and related arguments.")
 
     multi_control_model = MultiConditionControlNet(
         modules=control_modules,
@@ -557,34 +625,70 @@ def main():
     )
     print(f"Configured condition branches: {condition_branches}")
 
-    mask_paths = [os.path.join(mask_dir, file) for file in os.listdir(mask_dir) if file.lower().endswith('.png')]
-    mask_paths.sort()
-    if not mask_paths:
-        raise ValueError(f"No mask images found in {mask_dir}")
+    condition_file_maps: Dict[str, Dict[str, str]] = {}
+    if use_mask and mask_dir is not None:
+        mask_files = {
+            file: os.path.join(mask_dir, file)
+            for file in os.listdir(mask_dir)
+            if file.lower().endswith('.png')
+        }
+        if not mask_files:
+            raise ValueError(f"No mask images found in {mask_dir}")
+        condition_file_maps['mask'] = mask_files
 
-    condition_samples: List[Dict[str, str]] = []
-    mask_key = condition_definitions[0].key
-    for mask_path in mask_paths:
-        record: Dict[str, str] = {mask_key: mask_path}
-        mask_name = os.path.basename(mask_path)
-        missing_edge = False
+    if use_edges:
         for edge_key in edge_order:
-            edge_candidate = os.path.join(edge_dir_specs[edge_key], mask_name)
-            if not os.path.isfile(edge_candidate):
-                message = f"Missing edge file for '{edge_key}' corresponding to mask {mask_name}: {edge_candidate}"
-                if args.skip_missing_edges:
+            edge_dir = edge_dir_specs[edge_key]
+            edge_files = {
+                file: os.path.join(edge_dir, file)
+                for file in os.listdir(edge_dir)
+                if file.lower().endswith('.png')
+            }
+            if not edge_files:
+                raise ValueError(f"No edge images found for '{edge_key}' in {edge_dir}")
+            condition_file_maps[edge_key] = edge_files
+
+    primary_condition_key = 'mask' if use_mask else (edge_order[0] if edge_order else None)
+    if primary_condition_key is None:
+        raise RuntimeError("Unable to determine primary condition key for dataset enumeration.")
+
+    anchor_map = condition_file_maps.get(primary_condition_key, {})
+    if not anchor_map:
+        raise ValueError(f"No condition images found for primary key '{primary_condition_key}'.")
+
+    anchor_names = sorted(anchor_map.keys())
+    condition_samples: List[Dict[str, str]] = []
+    skipped_due_to_missing = 0
+    for name in anchor_names:
+        record: Dict[str, str] = {}
+        skip_sample = False
+        for definition in condition_definitions:
+            key = definition.key
+            file_map = condition_file_maps.get(key, {})
+            candidate_path = file_map.get(name)
+            if candidate_path is None:
+                expected_root = mask_dir if key == 'mask' else edge_dir_specs.get(key, '')
+                expected_path = os.path.join(expected_root, name) if expected_root else name
+                message = f"Missing condition file for '{key}' with base name {name}: expected {expected_path}"
+                if definition.modality == "edge" and args.skip_missing_edges:
                     print(f"Warning: {message}. Skipping this sample.")
-                    missing_edge = True
+                    skip_sample = True
                     break
                 raise FileNotFoundError(message)
-            record[edge_key] = edge_candidate
-        if missing_edge:
+            record[key] = candidate_path
+        if skip_sample:
+            skipped_due_to_missing += 1
             continue
         condition_samples.append(record)
 
     if not condition_samples:
-        print("No valid condition samples found after applying edge requirements. Nothing to generate.")
+        print("No valid condition samples found after applying the configured requirements. Nothing to generate.")
         return
+
+    if skipped_due_to_missing:
+        print(f"Skipped {skipped_due_to_missing} samples due to missing edge conditions.")
+
+    primary_condition_paths = [record[primary_condition_key] for record in condition_samples]
 
     prompts = [
         "A realistic scientific image of a cell taken from an electron microscope, photorealistic style, very detailed, black, white, detail",
@@ -630,9 +734,14 @@ def main():
     run_output_dir = os.path.join(args.output_base_dir, f"run_{timestamp_str}")
     os.makedirs(run_output_dir, exist_ok=True)
 
-    mask_path_list = [record[mask_key] for record in condition_samples]
     try:
-        save_generation_state(args, mask_path_list, run_output_dir, condition_records=condition_samples)
+        save_generation_state(
+            args,
+            primary_condition_paths,
+            run_output_dir,
+            condition_records=condition_samples,
+            primary_condition_key=primary_condition_key,
+        )
     except Exception as exc:
         print(f"Warning: failed to save generation state: {exc}")
 
