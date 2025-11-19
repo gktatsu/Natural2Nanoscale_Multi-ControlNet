@@ -242,13 +242,6 @@ def parse_args():
         help="Enable guess mode (less strict conditioning)."
     )
     parser.add_argument(
-        "--condition_type",
-        type=str,
-        default="segmentation",
-        choices=["segmentation", "edge"],
-        help="Condition modality to feed into ControlNet."
-    )
-    parser.add_argument(
         "--generation_mode",
         type=str,
         default="mask_and_edge",
@@ -497,9 +490,6 @@ def load_generation_state(filepath):
 # --- Main Script Logic ---
 def main():
     args = parse_args()
-
-    if args.condition_type and args.condition_type != "segmentation":
-        print("Warning: --condition_type is deprecated; please rely on --generation_mode instead.")
 
     generation_mode = args.generation_mode
     use_mask = generation_mode in ("mask_only", "mask_and_edge")
