@@ -499,8 +499,33 @@ def main():
         }
     # First use cpu to load models. Pytorch Lightning will automatically move it to GPUs.
     model = create_model(args.cldm_config_path, config_overrides=control_config_overrides).cpu()
+    checkpoint_state = load_state_dict(args.resume_path, location='cpu')
+
+    if args.condition_type == "rgba":
+        hint_weight_key = "control_model.input_hint_block.0.weight"
+        hint_bias_key = "control_model.input_hint_block.0.bias"
+        model_state = model.state_dict()
+        checkpoint_weight = checkpoint_state.get(hint_weight_key)
+        model_weight = model_state.get(hint_weight_key)
+
+        if checkpoint_weight is not None and model_weight is not None and checkpoint_weight.shape != model_weight.shape:
+            # Remove the mismatched weights so the freshly initialized layer stays untouched
+            checkpoint_state.pop(hint_weight_key, None)
+            checkpoint_state.pop(hint_bias_key, None)
+
+            hint_block = getattr(getattr(model, "control_model", None), "input_hint_block", None)
+            if hint_block is not None and len(hint_block) > 0:
+                first_layer = hint_block[0]
+                if hasattr(first_layer, "reset_parameters"):
+                    first_layer.reset_parameters()
+
+            print(
+                "[train] Reinitialized control_model.input_hint_block.0 parameters for RGBA hints before loading checkpoint "
+                "weights."
+            )
+
     # Check strict=False to allow loading partial models if necessary
-    model.load_state_dict(load_state_dict(args.resume_path, location='cpu'), strict=False)
+    model.load_state_dict(checkpoint_state, strict=False)
     model.learning_rate = args.learning_rate
     model.sd_locked = args.sd_locked
     model.only_mid_control = args.only_mid_control
