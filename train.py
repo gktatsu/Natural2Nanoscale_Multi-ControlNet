@@ -309,6 +309,12 @@ def parse_args():
         help="Path to the directory containing training edge maps."
     )
     parser.add_argument(
+        "--rgba_path",
+        type=str,
+        default=None,
+        help="Path to the directory containing training RGBA tensors (npz/png)."
+    )
+    parser.add_argument(
         "--val_image_path",
         type=str,
         default=None,
@@ -327,10 +333,16 @@ def parse_args():
         help="Path to the directory containing validation edge maps."
     )
     parser.add_argument(
+        "--val_rgba_path",
+        type=str,
+        default=None,
+        help="Path to the directory containing validation RGBA tensors."
+    )
+    parser.add_argument(
         "--condition_type",
         type=str,
         default="segmentation",
-        choices=["segmentation", "edge"],
+        choices=["segmentation", "edge", "rgba"],
         help="Condition modality to use for ControlNet conditioning."
     )
     parser.add_argument(
@@ -472,8 +484,21 @@ def main():
         print("WandB API key not provided as argument or environment variable. WandB logging might fail.")
 
     # --- Model Loading ---
+    control_config_overrides = None
+    if args.condition_type == "rgba":
+        control_config_overrides = {
+            "model": {
+                "params": {
+                    "control_stage_config": {
+                        "params": {
+                            "hint_channels": 4
+                        }
+                    }
+                }
+            }
+        }
     # First use cpu to load models. Pytorch Lightning will automatically move it to GPUs.
-    model = create_model(args.cldm_config_path).cpu()
+    model = create_model(args.cldm_config_path, config_overrides=control_config_overrides).cpu()
     # Check strict=False to allow loading partial models if necessary
     model.load_state_dict(load_state_dict(args.resume_path, location='cpu'), strict=False)
     model.learning_rate = args.learning_rate
@@ -498,10 +523,16 @@ def main():
         train_condition_dir = args.mask_path
         if train_condition_dir is None:
             raise ValueError("--mask_path must be provided when condition_type is 'segmentation'.")
-    else:
+    elif args.condition_type == "edge":
         train_condition_dir = args.edge_path
         if train_condition_dir is None:
             raise ValueError("--edge_path must be provided when condition_type is 'edge'.")
+    elif args.condition_type == "rgba":
+        train_condition_dir = args.rgba_path
+        if train_condition_dir is None:
+            raise ValueError("--rgba_path must be provided when condition_type is 'rgba'.")
+    else:
+        raise ValueError(f"Unsupported condition_type {args.condition_type}")
 
     train_dataset = MyDataset(
         args.image_path,
@@ -518,10 +549,16 @@ def main():
             val_condition_dir = args.val_mask_path
             if val_condition_dir is None:
                 raise ValueError("--val_mask_path must be provided when condition_type is 'segmentation'.")
-        else:
+        elif args.condition_type == "edge":
             val_condition_dir = args.val_edge_path
             if val_condition_dir is None:
                 raise ValueError("--val_edge_path must be provided when condition_type is 'edge'.")
+        elif args.condition_type == "rgba":
+            val_condition_dir = args.val_rgba_path
+            if val_condition_dir is None:
+                raise ValueError("--val_rgba_path must be provided when condition_type is 'rgba'.")
+        else:
+            raise ValueError(f"Unsupported condition_type {args.condition_type}")
 
         val_dataset = MyDataset(
             args.val_image_path,

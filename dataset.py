@@ -1,4 +1,6 @@
 import os
+import json
+from pathlib import Path
 import cv2
 import numpy as np
 import glob
@@ -21,7 +23,17 @@ class MyDataset(Dataset):
             raise ValueError("condition_dir must be provided.")
 
         self.imagePaths = sorted(glob.glob(os.path.join(image_dir, "*.png")))
-        self.conditionPaths = sorted(glob.glob(os.path.join(condition_dir, "*.png")))
+        if condition_type == "rgba":
+            rgba_npz = sorted(glob.glob(os.path.join(condition_dir, "*.npz")))
+            rgba_png = sorted(glob.glob(os.path.join(condition_dir, "*.png")))
+            stem_to_path = {}
+            for path in rgba_png:
+                stem_to_path.setdefault(Path(path).stem, path)
+            for path in rgba_npz:
+                stem_to_path[Path(path).stem] = path
+            self.conditionPaths = [stem_to_path[stem] for stem in sorted(stem_to_path.keys())]
+        else:
+            self.conditionPaths = sorted(glob.glob(os.path.join(condition_dir, "*.png")))
         self.condition_type = condition_type
 
         if len(self.imagePaths) == 0:
@@ -114,20 +126,20 @@ class MyDataset(Dataset):
             rgb_source = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
             for class_idx in range(3):
                 rgb_source[:, :, class_idx] = (mask == class_idx).astype(np.uint8) * 255
-            source = rgb_source
+            source_img = rgb_source
         elif self.condition_type == "edge":
             edge = cv2.imread(conditionPath, cv2.IMREAD_GRAYSCALE)
             if edge is None:
                 raise FileNotFoundError(f"Failed to read edge image: {conditionPath}")
-            source = cv2.cvtColor(edge, cv2.COLOR_GRAY2RGB)
+            source_img = cv2.cvtColor(edge, cv2.COLOR_GRAY2RGB)
+        elif self.condition_type == "rgba":
+            source_img = self._load_rgba_uint8(conditionPath)
         else:
             raise ValueError(f"Unsupported condition_type: {self.condition_type}")
 
         target = cv2.imread(imagePath) # 512,512,3 ; max = 244 min = 0
 
-       
-
-        source = self.resizePrepare(source, (512, 512))
+        source = self.resizePrepare(source_img, (512, 512))
         target = self.resizePrepare(target, (512, 512))
 
         if self.transforms is not None:
@@ -145,4 +157,42 @@ class MyDataset(Dataset):
         prompt = np.random.choice(self.prompts)
 
         return dict(jpg=target, txt=prompt, hint=source)
+
+    def _load_rgba_uint8(self, condition_path):
+        if condition_path.lower().endswith(".npz"):
+            data = np.load(condition_path)
+            if "rgba" not in data:
+                raise KeyError(f"NPZ file {condition_path} missing 'rgba' key")
+            rgba = data["rgba"].astype(np.float32)
+            value_range = None
+            if "meta" in data:
+                try:
+                    meta_raw = data["meta"]
+                    if isinstance(meta_raw, np.ndarray):
+                        meta_raw = meta_raw.tolist()
+                    if isinstance(meta_raw, bytes):
+                        meta_raw = meta_raw.decode("utf-8")
+                    meta_dict = json.loads(str(meta_raw))
+                    value_range = meta_dict.get("value_range")
+                except Exception:
+                    value_range = None
+            if value_range == "neg_one_to_one":
+                rgba = (rgba + 1.0) * 127.5
+            elif value_range == "zero_one":
+                rgba = rgba * 255.0
+            elif rgba.max() <= 1.0:
+                rgba = rgba * 255.0
+            rgba_uint8 = np.clip(rgba, 0, 255).astype(np.uint8)
+            return rgba_uint8
+        rgba = cv2.imread(condition_path, cv2.IMREAD_UNCHANGED)
+        if rgba is None:
+            raise FileNotFoundError(f"Failed to read RGBA condition: {condition_path}")
+        if rgba.ndim == 2:
+            rgba = cv2.cvtColor(rgba, cv2.COLOR_GRAY2RGBA)
+        if rgba.shape[2] == 3:
+            alpha = np.zeros_like(rgba[:, :, :1])
+            rgba = np.concatenate([rgba, alpha], axis=-1)
+        elif rgba.shape[2] > 4:
+            rgba = rgba[:, :, :4]
+        return rgba
 
