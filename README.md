@@ -125,7 +125,7 @@ python utils/build_rgba_dataset.py \
     --preview-max 32
 ```
 
-The script stores compressed `.npz` tensors (mask RGB in channels R/G/B, Canny edge in channel A) and optional `preview/*.png` triptychs (original/mask/edge) to visually inspect alignment before training.
+The script stores compressed `.npz` tensors (mask RGB in channels R/G/B, Canny edge in channel A) and optional `preview/*.png` triptychs (original/mask/edge) to visually inspect alignment before training. The `--dest_dir` acts as the base folder; outputs are written to `<dest_dir>/<canny_low>_<canny_high>` so each threshold pair stays isolated automatically.
 
 ## Generate Images
 To generate images with a pretrained ControlNet do: 

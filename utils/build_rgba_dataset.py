@@ -18,7 +18,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Precompute RGBA control tensors by fusing masks and Canny edges.")
     parser.add_argument("--img_dir", required=True, type=Path, help="Directory containing source images.")
     parser.add_argument("--mask_dir", required=True, type=Path, help="Directory containing mask images (grayscale labels).")
-    parser.add_argument("--dest_dir", required=True, type=Path, help="Directory where RGBA tensors will be saved.")
+    parser.add_argument(
+        "--dest_dir",
+        required=True,
+        type=Path,
+        help="Base directory for RGBA tensors. The script will create a <canny_low>_<canny_high> subfolder automatically.",
+    )
     parser.add_argument(
         "--fmt",
         nargs="+",
@@ -105,6 +110,10 @@ def main() -> None:
     img_dir = args.img_dir.resolve()
     mask_dir = args.mask_dir.resolve()
     dest_dir = args.dest_dir.resolve()
+    dest_suffix = f"{args.canny_low}_{args.canny_high}"
+    if dest_dir.name != dest_suffix:
+        dest_dir = dest_dir / dest_suffix
+    print(f"[INFO] Saving outputs to {dest_dir}")
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     preview_dir = args.preview_dir.resolve() if args.preview_dir else dest_dir / "preview"
