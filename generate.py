@@ -22,6 +22,20 @@ from cldm.ddim_hacked import DDIMSampler
 DEFAULT_EDGE_KEY = "edge"
 
 
+def build_hint_override(hint_channels: int):
+    return {
+        "model": {
+            "params": {
+                "control_stage_config": {
+                    "params": {
+                        "hint_channels": hint_channels
+                    }
+                }
+            }
+        }
+    }
+
+
 @dataclass(frozen=True)
 class ConditionDefinition:
     key: str
@@ -134,6 +148,46 @@ def seed_everything(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+
+def load_rgba_condition(path: str) -> np.ndarray:
+    if path.lower().endswith(".npz"):
+        data = np.load(path)
+        if "rgba" not in data:
+            raise KeyError(f"NPZ file {path} missing 'rgba' array")
+        rgba = data["rgba"].astype(np.float32)
+        value_range = None
+        if "meta" in data:
+            try:
+                meta_raw = data["meta"]
+                if isinstance(meta_raw, np.ndarray):
+                    meta_raw = meta_raw.tolist()
+                if isinstance(meta_raw, bytes):
+                    meta_raw = meta_raw.decode("utf-8")
+                meta = json.loads(str(meta_raw))
+                value_range = meta.get("value_range")
+            except Exception:
+                value_range = None
+        if value_range == "neg_one_to_one":
+            rgba = (rgba + 1.0) / 2.0
+        elif value_range == "zero_one":
+            pass
+        elif rgba.max() > 1.0:
+            rgba = rgba / 255.0
+        return np.clip(rgba, 0.0, 1.0)
+
+    rgba = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if rgba is None:
+        raise FileNotFoundError(f"Unable to load RGBA condition at {path}")
+    if rgba.ndim == 2:
+        rgba = cv2.cvtColor(rgba, cv2.COLOR_GRAY2RGBA)
+    if rgba.shape[2] == 3:
+        alpha = np.zeros_like(rgba[:, :, :1])
+        rgba = np.concatenate([rgba, alpha], axis=-1)
+    elif rgba.shape[2] > 4:
+        rgba = rgba[:, :, :4]
+    rgba = cv2.cvtColor(rgba, cv2.COLOR_BGRA2RGBA)
+    return np.clip(rgba.astype(np.float32) / 255.0, 0.0, 1.0)
+
 # --- Argument Parsing ---
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate synthetic images using ControlNet with configurable conditioning inputs.")
@@ -245,7 +299,7 @@ def parse_args():
         "--generation_mode",
         type=str,
         default="mask_and_edge",
-        choices=["mask_only", "edge_only", "mask_and_edge"],
+        choices=["mask_only", "edge_only", "mask_and_edge", "rgba"],
         help="Select which condition branches to use during generation."
     )
     parser.add_argument(
@@ -260,6 +314,18 @@ def parse_args():
         nargs='+',
         default=[],
         help="Optional relative strengths for edge ControlNet branches formatted as '<name>=<float>'."
+    )
+    parser.add_argument(
+        "--rgba_dir",
+        type=str,
+        default=None,
+        help="Directory containing RGBA npz/png control tensors (required when generation_mode=rgba)."
+    )
+    parser.add_argument(
+        "--rgba_model_path",
+        type=str,
+        default=None,
+        help="Optional checkpoint to use for RGBA ControlNet (defaults to --model_weights_path)."
     )
     parser.add_argument(
         "--skip_missing_edges",
@@ -321,15 +387,24 @@ def process(
                 for class_idx in range(max_channel):
                     rgb_condition[:, :, class_idx] = (condition_gray == class_idx).astype(np.uint8) * 255
                 if definition.channels > max_channel:
-                    # Fill any remaining channels with zeros to maintain expected width
                     for channel_idx in range(max_channel, definition.channels):
                         rgb_condition[:, :, channel_idx] = 0
+                preview_img = condition_gray
             elif definition.modality == "edge":
                 rgb_condition = cv2.cvtColor(condition_gray, cv2.COLOR_GRAY2RGB)
+                preview_img = condition_gray
+            elif definition.modality == "rgba":
+                rgba = load_rgba_condition(condition_path)
+                rgb_condition = np.clip(rgba * 255.0, 0, 255).astype(np.uint8)
+                if rgb_condition.shape[2] != definition.channels:
+                    raise ValueError(
+                        f"RGBA condition {condition_path} has {rgb_condition.shape[2]} channels but expected {definition.channels}"
+                    )
+                preview_img = cv2.cvtColor(rgb_condition[:, :, :3], cv2.COLOR_RGB2BGR)
             else:
                 raise ValueError(f"Unsupported condition modality: {definition.modality}")
 
-            prepared_conditions.append((definition, rgb_condition, condition_gray))
+            prepared_conditions.append((definition, rgb_condition, preview_img))
 
         if not prepared_conditions:
             print("Warning: No conditioning information prepared. Skipping batch.")
@@ -395,12 +470,12 @@ def process(
             cv2.imwrite(img_result_path, cv2.cvtColor(x_samples[i], cv2.COLOR_RGB2BGR))
             print(f'{output_img_filename} has the prompt "{prompt}"')
 
-            for definition, _, condition_gray in prepared_conditions:
+            for definition, _, condition_preview in prepared_conditions:
                 condition_dir = os.path.join(condition_save_path, definition.key)
                 os.makedirs(condition_dir, exist_ok=True)
                 condition_filename = f'{definition.key}_cond{img_idx}_batch{batch_idx}_sample{i}.png'
                 condition_result_path = os.path.join(condition_dir, condition_filename)
-                cv2.imwrite(condition_result_path, condition_gray)
+                cv2.imwrite(condition_result_path, condition_preview)
 
         return [x_samples[i] for i in range(num_samples_per_inference)]
 
@@ -494,9 +569,16 @@ def main():
     generation_mode = args.generation_mode
     use_mask = generation_mode in ("mask_only", "mask_and_edge")
     use_edges = generation_mode in ("edge_only", "mask_and_edge")
+    use_rgba = generation_mode == "rgba"
+
+    if use_rgba:
+        use_mask = False
+        use_edges = False
 
     if not use_mask and args.mask_strength is not None:
         print("Warning: --mask_strength specified but generation mode does not use mask conditioning; ignoring.")
+    if use_rgba and args.mask_strength is not None:
+        print("Warning: --mask_strength is ignored in rgba generation mode.")
 
     edge_model_specs = parse_key_value_pairs(args.edge_model_paths, "--edge_model_paths") if args.edge_model_paths else {}
     if args.edge_model_path:
@@ -533,9 +615,23 @@ def main():
     elif args.mask_dir is not None:
         print("Warning: --mask_dir was provided but generation mode does not use masks; ignoring.")
 
+    rgba_dir: Optional[str] = None
+    if use_rgba:
+        if args.rgba_dir is None:
+            raise ValueError("--rgba_dir must be specified when generation_mode=rgba.")
+        rgba_dir = os.path.abspath(args.rgba_dir)
+        if not os.path.isdir(rgba_dir):
+            raise FileNotFoundError(f"RGBA directory not found: {rgba_dir}")
+    elif args.rgba_dir is not None:
+        print("Warning: --rgba_dir provided but generation mode is not 'rgba'; ignoring.")
+
     base_model_path = args.model_weights_path or args.mask_model_path
+    if use_rgba and args.rgba_model_path:
+        base_model_path = args.rgba_model_path
+    elif not use_rgba and args.rgba_model_path is not None:
+        print("Warning: --rgba_model_path provided but generation mode is not 'rgba'; ignoring.")
     if base_model_path is None:
-        raise ValueError("--model_weights_path must be provided to initialize the base ControlNet model.")
+        raise ValueError("A ControlNet checkpoint path must be provided via --model_weights_path (or --rgba_model_path).")
     base_model_path = os.path.abspath(base_model_path)
     if not os.path.isfile(base_model_path):
         raise FileNotFoundError(f"Base ControlNet checkpoint not found: {base_model_path}")
@@ -552,12 +648,15 @@ def main():
         print("Warning: --edge_strengths specified but generation mode does not use edges; ignoring.")
         edge_strength_map = {}
 
-    model = create_model(args.config_yaml_path).cpu()
+    model_config_overrides = build_hint_override(4) if use_rgba else None
+    model = create_model(args.config_yaml_path, config_overrides=model_config_overrides).cpu()
     model.load_state_dict(load_state_dict(base_model_path, location='cpu'), strict=False)
 
     condition_definitions: List[ConditionDefinition] = []
     control_modules: List[torch.nn.Module] = []
     condition_strengths: List[float] = []
+    channel_splits: List[int] = []
+    module_condition_keys: List[str] = []
 
     if use_mask:
         mask_model_path = args.mask_model_path or base_model_path
@@ -569,11 +668,12 @@ def main():
         mask_control = mask_model.control_model
         freeze_module(mask_control)
         mask_control.eval()
-        condition_definitions.append(
-            ConditionDefinition(key="mask", modality="segmentation", display_name="mask", channels=3)
-        )
+        mask_definition = ConditionDefinition(key="mask", modality="segmentation", display_name="mask", channels=3)
+        condition_definitions.append(mask_definition)
         control_modules.append(mask_control)
         condition_strengths.append(args.mask_strength if args.mask_strength is not None else 1.0)
+        channel_splits.append(mask_definition.channels)
+        module_condition_keys.append(mask_definition.key)
         del mask_model
 
     edge_order: List[str] = []
@@ -589,26 +689,36 @@ def main():
             freeze_module(edge_control)
             edge_control.eval()
             control_modules.append(edge_control)
-            condition_definitions.append(
-                ConditionDefinition(key=edge_key, modality="edge", display_name=edge_key, channels=3)
-            )
+            edge_definition = ConditionDefinition(key=edge_key, modality="edge", display_name=edge_key, channels=3)
+            condition_definitions.append(edge_definition)
             condition_strengths.append(edge_strength_map.get(edge_key, 1.0))
+            channel_splits.append(edge_definition.channels)
+            module_condition_keys.append(edge_definition.key)
             del edge_model
+
+    if use_rgba:
+        rgba_definition = ConditionDefinition(key="rgba", modality="rgba", display_name="rgba", channels=4)
+        condition_definitions.append(rgba_definition)
 
     if not condition_definitions:
         raise RuntimeError("No conditioning branches configured. Check --generation_mode and related arguments.")
 
-    multi_control_model = MultiConditionControlNet(
-        modules=control_modules,
-        channel_splits=[definition.channels for definition in condition_definitions],
-        condition_keys=[definition.key for definition in condition_definitions],
-        per_condition_scales=condition_strengths,
-    )
-    model.control_model = multi_control_model
+    if control_modules:
+        multi_control_model = MultiConditionControlNet(
+            modules=control_modules,
+            channel_splits=channel_splits,
+            condition_keys=module_condition_keys,
+            per_condition_scales=condition_strengths,
+        )
+        model.control_model = multi_control_model
+        condition_scale_map = multi_control_model.get_condition_scales()
+    else:
+        multi_control_model = None
+        condition_scale_map = {definition.key: args.strength for definition in condition_definitions}
+
     model = model.cuda()
     ddim_sampler = DDIMSampler(model)
 
-    condition_scale_map = multi_control_model.get_condition_scales()
     condition_branches = ", ".join(
         f"{definition.key}(strength={condition_scale_map[definition.key]:.2f})"
         for definition in condition_definitions
@@ -638,7 +748,20 @@ def main():
                 raise ValueError(f"No edge images found for '{edge_key}' in {edge_dir}")
             condition_file_maps[edge_key] = edge_files
 
-    primary_condition_key = 'mask' if use_mask else (edge_order[0] if edge_order else None)
+    if use_rgba and rgba_dir is not None:
+        rgba_files = {
+            file: os.path.join(rgba_dir, file)
+            for file in os.listdir(rgba_dir)
+            if file.lower().endswith(('.npz', '.png'))
+        }
+        if not rgba_files:
+            raise ValueError(f"No RGBA tensors found in {rgba_dir}")
+        condition_file_maps['rgba'] = rgba_files
+
+    if use_rgba:
+        primary_condition_key = 'rgba'
+    else:
+        primary_condition_key = 'mask' if use_mask else (edge_order[0] if edge_order else None)
     if primary_condition_key is None:
         raise RuntimeError("Unable to determine primary condition key for dataset enumeration.")
 
@@ -657,7 +780,14 @@ def main():
             file_map = condition_file_maps.get(key, {})
             candidate_path = file_map.get(name)
             if candidate_path is None:
-                expected_root = mask_dir if key == 'mask' else edge_dir_specs.get(key, '')
+                if key == 'mask':
+                    expected_root = mask_dir
+                elif key in edge_dir_specs:
+                    expected_root = edge_dir_specs.get(key, '')
+                elif key == 'rgba':
+                    expected_root = rgba_dir
+                else:
+                    expected_root = ''
                 expected_path = os.path.join(expected_root, name) if expected_root else name
                 message = f"Missing condition file for '{key}' with base name {name}: expected {expected_path}"
                 if definition.modality == "edge" and args.skip_missing_edges:
