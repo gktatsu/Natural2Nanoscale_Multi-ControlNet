@@ -97,6 +97,36 @@ python train.py \
 *Please note that the code currently only supports encoding of three classes.*
 Model weights and log images will be saved at `./models/timestamp`. 
 
+To train the unified RGBA ControlNet (mask + Canny edge in one tensor), first precompute the conditioning tensors (see next section) and then switch the `condition_type`:
+
+```bash
+python train.py \
+    --condition_type rgba \
+    --image_path /path/to/my/images \
+    --rgba_path /path/to/my_rgba/train \
+    --val_rgba_path /path/to/my_rgba/val \
+    --resume ./models/control_sd15_ini.ckpt \
+    --gpus 1
+```
+
+When `condition_type=rgba` the trainer automatically instantiates a ControlNet whose hint branch expects 4 channels.
+
+## Precompute RGBA conditioning
+
+Use `utils/build_rgba_dataset.py` to fuse masks and freshly computed Canny edges into `(H, W, 4)` tensors before launching cluster jobs:
+
+```bash
+python utils/build_rgba_dataset.py \
+    --img_dir data/images/train \
+    --mask_dir data/masks/train \
+    --dest_dir data_rgba/train \
+    --fmt npz \
+    --canny-low 100 --canny-high 200 --beta-edge 1.0 \
+    --preview-max 32
+```
+
+The script stores compressed `.npz` tensors (mask RGB in channels R/G/B, Canny edge in channel A) and optional `preview/*.png` triptychs (original/mask/edge) to visually inspect alignment before training.
+
 ## Generate Images
 To generate images with a pretrained ControlNet do: 
 ```bash
@@ -108,6 +138,19 @@ python generate.py \
     --n_augmentations_per_mask 1 \
     --batch_size_per_inference 1 
 ```
+
+For the single-branch RGBA model, point the generator to the precomputed RGBA tensors and enable the new mode:
+
+```bash
+python generate.py \
+    --generation_mode rgba \
+    --rgba_dir data_rgba/val \
+    --config_yaml_path ./models/cldm_v15.yaml \
+    --rgba_model_path ./models/rgba_controlnet.ckpt \
+    --output_base_dir ./my_synth_data_rgba
+```
+
+The same RGBA tensors used for training can be re-used during inference, ensuring parity between train/test pipelines.
 
 
 
