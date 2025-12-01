@@ -16,7 +16,7 @@ def is_image_not_augmented(filename):
     return bool(pattern.match(filename))
 
 class MyDataset(Dataset):
-    def __init__(self, image_dir, condition_dir, augment=True, condition_type="segmentation"):
+    def __init__(self, image_dir, condition_dir, augment=True, condition_type="segmentation", rgba_alpha_scale: float = 1.0):
         if image_dir is None:
             raise ValueError("image_dir must be provided.")
         if condition_dir is None:
@@ -35,6 +35,7 @@ class MyDataset(Dataset):
         else:
             self.conditionPaths = sorted(glob.glob(os.path.join(condition_dir, "*.png")))
         self.condition_type = condition_type
+        self.rgba_alpha_scale = float(rgba_alpha_scale)
 
         if len(self.imagePaths) == 0:
             raise ValueError(f"No training images found in {image_dir}.")
@@ -150,6 +151,10 @@ class MyDataset(Dataset):
 
         # Normalize source images to [0, 1].
         source = source.astype(np.float32) / 255.0
+
+        if self.condition_type == "rgba" and self.rgba_alpha_scale != 1.0 and source.shape[-1] > 3:
+            source_alpha = source[:, :, 3]
+            source[:, :, 3] = np.clip(source_alpha * self.rgba_alpha_scale, 0.0, 1.0)
 
         # Normalize target images to [-1, 1].
         target = (target.astype(np.float32) / 127.5) - 1.0

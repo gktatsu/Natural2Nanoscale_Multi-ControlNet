@@ -315,6 +315,12 @@ def parse_args():
         help="Path to the directory containing training RGBA tensors (npz/png)."
     )
     parser.add_argument(
+        "--rgba_alpha_scale",
+        type=float,
+        default=1.0,
+        help="Scaling factor applied to the alpha (edge) channel when condition_type is 'rgba'."
+    )
+    parser.add_argument(
         "--val_image_path",
         type=str,
         default=None,
@@ -564,6 +570,7 @@ def main():
         train_condition_dir,
         augment=True,
         condition_type=args.condition_type,
+        rgba_alpha_scale=args.rgba_alpha_scale,
     )
     train_loader = DataLoader(train_dataset, num_workers=args.num_workers, batch_size=args.batch_size, shuffle=True)
 
@@ -590,6 +597,7 @@ def main():
             val_condition_dir,
             augment=False,
             condition_type=args.condition_type,
+            rgba_alpha_scale=args.rgba_alpha_scale,
         )
         val_loader = DataLoader(val_dataset, num_workers=args.num_workers, batch_size=args.batch_size, shuffle=False)
         checkpoint_monitor = 'val/loss'
