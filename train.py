@@ -4,6 +4,7 @@ import datetime
 import argparse # Import argparse
 import os
 import shutil
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -536,18 +537,20 @@ def main():
     model.sd_locked = args.sd_locked
     model.only_mid_control = args.only_mid_control
     
-    now = datetime.datetime.now()
-    timestamp_str = now.strftime("%Y%m%d_%H%M%S")
-    output_dir = f"./models/{timestamp_str}/"
-    os.makedirs(output_dir, exist_ok=True)
+    # Timestamp + PID + random suffix keeps concurrent launches from sharing the same run directory.
+    timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    unique_suffix = f"p{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    run_id = f"{timestamp_str}_{unique_suffix}"
+    output_dir = Path("./models") / run_id
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # --- WandB Initialization ---
     wandb.init(
         project=args.wandb_project,
         config=vars(args), # Log all argparse arguments to WandB config
-        name=f"training_run_{timestamp_str}" # Optional: add a run name
+        name=f"training_run_{run_id}" # Optional: add a run name
     )
-    wandb_logger = pl.loggers.WandbLogger(save_dir=output_dir, project=args.wandb_project, log_model=False)
+    wandb_logger = pl.loggers.WandbLogger(save_dir=str(output_dir), project=args.wandb_project, log_model=False)
 
     # --- Data Loading ---
     if args.condition_type == "segmentation":
@@ -604,7 +607,7 @@ def main():
 
     # --- Checkpointing ---
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        dirpath=output_dir,
+        dirpath=str(output_dir),
         filename=f'EM_best_results',
         save_weights_only=True,
         monitor=checkpoint_monitor,
@@ -617,7 +620,7 @@ def main():
 
     fid_callback = None
     if val_loader is not None and args.enable_val_fid:
-        fid_output_dir = os.path.join(output_dir, "val_generations")
+        fid_output_dir = output_dir / "val_generations"
         fid_callback = ValidationFIDCallback(
             val_dataset=val_dataset,
             real_image_dir=args.val_image_path,
