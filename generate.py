@@ -11,6 +11,7 @@ import torch
 import random
 import datetime
 import argparse # Import argparse
+import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -850,8 +851,10 @@ def main():
         "Intricate black-and-white composition showcasing the elegance of cellular architecture, with a focus on fine details and contours",
     ]
 
-    timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_output_dir = os.path.join(args.output_base_dir, f"run_{timestamp_str}")
+    timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    unique_suffix = f"p{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    run_id = f"{timestamp_str}_{unique_suffix}"
+    run_output_dir = os.path.join(args.output_base_dir, f"run_{run_id}")
     os.makedirs(run_output_dir, exist_ok=True)
 
     try:
