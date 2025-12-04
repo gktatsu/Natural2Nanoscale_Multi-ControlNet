@@ -473,6 +473,12 @@ def parse_args():
         default=0, # Keeping original 0, but often >0 is better for data loading
         help="Number of data loading workers."
     )
+    parser.add_argument(
+        "--output_root",
+        type=str,
+        default="./models",
+        help="Parent directory where checkpoints, logs, and other run artifacts are saved."
+    )
 
 
     args = parser.parse_args()
@@ -541,7 +547,8 @@ def main():
     timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     unique_suffix = f"p{os.getpid()}_{uuid.uuid4().hex[:8]}"
     run_id = f"{timestamp_str}_{unique_suffix}"
-    output_dir = Path("./models") / run_id
+    output_root = Path(args.output_root).expanduser().resolve()
+    output_dir = output_root / run_id
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # --- WandB Initialization ---
