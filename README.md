@@ -95,7 +95,7 @@ python train.py \
 ```
 
 *Please note that the code currently only supports encoding of three classes.*
-Model weights and log images will be saved at `./models/timestamp`. 
+Model weights and log images will be saved under `./models/<timestamp>_...` by default. Pass `--output_root /custom/path` to store runs in a different base directory.
 
 To train the unified RGBA ControlNet (mask + Canny edge in one tensor), first precompute the conditioning tensors (see next section) and then switch the `condition_type`:
 
