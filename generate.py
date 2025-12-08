@@ -413,7 +413,20 @@ def process(
                     raise ValueError(
                         f"RGBA condition {condition_path} has {rgb_condition.shape[2]} channels but expected {definition.channels}"
                     )
-                preview_img = cv2.cvtColor(rgb_condition[:, :, :3], cv2.COLOR_RGB2BGR)
+                
+                # Generate edge visualization (white background + RGB colors)
+                H, W = rgb_condition.shape[:2]
+                rgb_only = rgb_condition[:, :, :3]
+                edge_vis = np.ones((H, W, 3), dtype=np.uint8) * 255
+                mask = (rgb_only[:, :, 0] > 0) | (rgb_only[:, :, 1] > 0) | (rgb_only[:, :, 2] > 0)
+                edge_vis[mask] = rgb_only[mask]
+                edge_vis_bgr = cv2.cvtColor(edge_vis, cv2.COLOR_RGB2BGR)
+                
+                # Generate segmentation mask (argmax over RGB channels -> 0, 1, 2)
+                segmentation_mask = np.argmax(rgb_only, axis=2).astype(np.uint8)
+                
+                # Store as tuple: (edge_vis_bgr, segmentation_mask)
+                preview_img = (edge_vis_bgr, segmentation_mask)
             else:
                 raise ValueError(f"Unsupported condition modality: {definition.modality}")
 
@@ -484,11 +497,28 @@ def process(
             print(f'{output_img_filename} has the prompt "{prompt}"')
 
             for definition, _, condition_preview in prepared_conditions:
-                condition_dir = os.path.join(condition_save_path, definition.key)
-                os.makedirs(condition_dir, exist_ok=True)
-                condition_filename = f'{definition.key}_cond{img_idx}_batch{batch_idx}_sample{i}.png'
-                condition_result_path = os.path.join(condition_dir, condition_filename)
-                cv2.imwrite(condition_result_path, condition_preview)
+                if definition.modality == "rgba" and isinstance(condition_preview, tuple):
+                    # RGBA mode: save two types of images
+                    edge_vis_bgr, segmentation_mask = condition_preview
+                    
+                    # Save edge visualization (white background + RGB colors)
+                    edge_vis_dir = os.path.join(condition_save_path, "rgba_edge_vis")
+                    os.makedirs(edge_vis_dir, exist_ok=True)
+                    edge_vis_filename = f'rgba_edge_vis_cond{img_idx}_batch{batch_idx}_sample{i}.png'
+                    cv2.imwrite(os.path.join(edge_vis_dir, edge_vis_filename), edge_vis_bgr)
+                    
+                    # Save segmentation mask (0, 1, 2 grayscale)
+                    mask_dir = os.path.join(condition_save_path, "rgba_mask")
+                    os.makedirs(mask_dir, exist_ok=True)
+                    mask_filename = f'rgba_mask_cond{img_idx}_batch{batch_idx}_sample{i}.png'
+                    cv2.imwrite(os.path.join(mask_dir, mask_filename), segmentation_mask)
+                else:
+                    # Other modalities: save as before
+                    condition_dir = os.path.join(condition_save_path, definition.key)
+                    os.makedirs(condition_dir, exist_ok=True)
+                    condition_filename = f'{definition.key}_cond{img_idx}_batch{batch_idx}_sample{i}.png'
+                    condition_result_path = os.path.join(condition_dir, condition_filename)
+                    cv2.imwrite(condition_result_path, condition_preview)
 
         return [x_samples[i] for i in range(num_samples_per_inference)]
 
