@@ -370,32 +370,44 @@ def process(
             if condition_path is None:
                 raise KeyError(f"Missing condition path for key '{definition.key}' in condition_sample")
 
-            condition_gray = cv2.imread(condition_path, cv2.IMREAD_GRAYSCALE)
-            if condition_gray is None:
-                print(f"Error: Could not read condition image at {condition_path}. Skipping.")
-                return []
+            if definition.modality in ("segmentation", "edge"):
+                condition_gray = cv2.imread(condition_path, cv2.IMREAD_GRAYSCALE)
+                if condition_gray is None:
+                    print(f"Error: Could not read condition image at {condition_path}. Skipping.")
+                    return []
 
-            if target_hw is None:
-                target_hw = condition_gray.shape[:2]
-            elif condition_gray.shape[:2] != target_hw:
-                interpolation = cv2.INTER_NEAREST if definition.modality == "segmentation" else cv2.INTER_LINEAR
-                condition_gray = cv2.resize(condition_gray, (target_hw[1], target_hw[0]), interpolation=interpolation)
+                if target_hw is None:
+                    target_hw = condition_gray.shape[:2]
+                elif condition_gray.shape[:2] != target_hw:
+                    interpolation = cv2.INTER_NEAREST if definition.modality == "segmentation" else cv2.INTER_LINEAR
+                    condition_gray = cv2.resize(condition_gray, (target_hw[1], target_hw[0]), interpolation=interpolation)
 
-            if definition.modality == "segmentation":
-                H, W = condition_gray.shape
-                rgb_condition = np.zeros((H, W, definition.channels), dtype=np.uint8)
-                max_channel = min(definition.channels, num_segmentation_classes)
-                for class_idx in range(max_channel):
-                    rgb_condition[:, :, class_idx] = (condition_gray == class_idx).astype(np.uint8) * 255
-                if definition.channels > max_channel:
-                    for channel_idx in range(max_channel, definition.channels):
-                        rgb_condition[:, :, channel_idx] = 0
-                preview_img = condition_gray
-            elif definition.modality == "edge":
-                rgb_condition = cv2.cvtColor(condition_gray, cv2.COLOR_GRAY2RGB)
-                preview_img = condition_gray
+                if definition.modality == "segmentation":
+                    H, W = condition_gray.shape
+                    rgb_condition = np.zeros((H, W, definition.channels), dtype=np.uint8)
+                    max_channel = min(definition.channels, num_segmentation_classes)
+                    for class_idx in range(max_channel):
+                        rgb_condition[:, :, class_idx] = (condition_gray == class_idx).astype(np.uint8) * 255
+                    if definition.channels > max_channel:
+                        for channel_idx in range(max_channel, definition.channels):
+                            rgb_condition[:, :, channel_idx] = 0
+                    preview_img = condition_gray
+                else:  # edge
+                    rgb_condition = cv2.cvtColor(condition_gray, cv2.COLOR_GRAY2RGB)
+                    preview_img = condition_gray
+
             elif definition.modality == "rgba":
-                rgba = load_rgba_condition(condition_path)
+                try:
+                    rgba = load_rgba_condition(condition_path)
+                except Exception as exc:
+                    print(f"Error: Could not read RGBA condition at {condition_path} ({exc}). Skipping.")
+                    return []
+
+                if target_hw is None:
+                    target_hw = rgba.shape[:2]
+                elif rgba.shape[:2] != target_hw:
+                    rgba = cv2.resize(rgba, (target_hw[1], target_hw[0]), interpolation=cv2.INTER_LINEAR)
+
                 rgb_condition = np.clip(rgba * 255.0, 0, 255).astype(np.uint8)
                 if rgb_condition.shape[2] != definition.channels:
                     raise ValueError(
