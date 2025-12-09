@@ -414,12 +414,30 @@ def process(
                         f"RGBA condition {condition_path} has {rgb_condition.shape[2]} channels but expected {definition.channels}"
                     )
                 
-                # Generate edge visualization (white background + RGB colors)
+                # Generate edge visualization (white background + colored edges by class)
+                # RGB channels contain mask class info, Alpha channel contains edge intensity
                 H, W = rgb_condition.shape[:2]
-                rgb_only = rgb_condition[:, :, :3]
+                rgb_only = rgb_condition[:, :, :3]  # R=class0, G=class1, B=class2
+                alpha_channel = rgb_condition[:, :, 3]  # Edge intensity
+                
+                # Create white background
                 edge_vis = np.ones((H, W, 3), dtype=np.uint8) * 255
-                mask = (rgb_only[:, :, 0] > 0) | (rgb_only[:, :, 1] > 0) | (rgb_only[:, :, 2] > 0)
-                edge_vis[mask] = rgb_only[mask]
+                
+                # For each pixel with edge (alpha > threshold), color it based on max RGB channel
+                edge_threshold = 10  # Threshold to detect edge pixels
+                edge_mask = alpha_channel > edge_threshold
+                
+                # Get class assignment for edge pixels (argmax of RGB)
+                class_assignment = np.argmax(rgb_only, axis=2)
+                
+                # Color mapping: class0=red, class1=green, class2=blue
+                colors = np.array([[255, 0, 0], [0, 255, 0], [0, 0, 255]], dtype=np.uint8)
+                
+                # Apply colors only where there's an edge
+                for class_idx in range(3):
+                    class_edge_mask = edge_mask & (class_assignment == class_idx)
+                    edge_vis[class_edge_mask] = colors[class_idx]
+                
                 edge_vis_bgr = cv2.cvtColor(edge_vis, cv2.COLOR_RGB2BGR)
                 
                 # Generate segmentation mask (argmax over RGB channels -> 0, 1, 2)
