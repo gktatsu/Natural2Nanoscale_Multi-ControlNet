@@ -152,6 +152,163 @@ python generate.py \
 
 The same RGBA tensors used for training can be re-used during inference, ensuring parity between train/test pipelines.
 
+## Additional Training Options
 
+The `train.py` script supports many additional command-line options beyond the basic examples above:
+
+### Data Path Options
+| Option | Description |
+|---|---|
+| `--edge_path` | Path to the directory containing training edge maps |
+| `--val_image_path` | Path to validation images |
+| `--val_mask_path` | Path to validation masks |
+| `--val_edge_path` | Path to validation edge maps |
+| `--val_rgba_path` | Path to validation RGBA tensors |
+| `--rgba_alpha_scale` | Scaling factor for the alpha (edge) channel when using `condition_type=rgba` |
+
+### Validation FID Options
+Enable CEM FID computation during training with `--enable_val_fid`:
+
+| Option | Default | Description |
+|---|---|---|
+| `--enable_val_fid` | `False` | Compute CEM FID on validation splits after each epoch |
+| `--fid_batch_size` | `2` | Batch size for validation generation and FID feature extraction |
+| `--fid_num_workers` | `0` | Number of workers for validation dataloaders |
+| `--fid_ddim_steps` | `50` | Number of DDIM steps for validation image generation |
+| `--fid_guidance_scale` | `9.0` | Classifier-free guidance scale for validation |
+| `--fid_eta` | `0.0` | DDIM eta value for validation generation |
+| `--fid_control_strength` | `1.0` | Control strength multiplier for validation generation |
+| `--fid_backbone` | `cem500k` | Backbone for CEM FID (`cem500k` or `cem1.5m`) |
+| `--fid_image_size` | `512` | Input size expected by the CEM backbone |
+| `--fid_device` | `cuda` | Device for CEM FID feature extraction |
+| `--fid_weights_path` | `None` | Optional local path to pre-downloaded CEM weights |
+| `--fid_download_dir` | `None` | Optional directory to cache downloaded CEM weights |
+
+### Model Configuration
+| Option | Default | Description |
+|---|---|---|
+| `--cldm_config_path` | `./models/cldm_v15.yaml` | Path to the ControlNet model configuration YAML file |
+| `--condition_type` | `segmentation` | Condition modality: `segmentation`, `edge`, or `rgba` |
+
+## Additional Generation Options
+
+The `generate.py` script provides extensive options for fine-grained control over image generation:
+
+### Model Path Options
+| Option | Description |
+|---|---|
+| `--mask_model_path` | Path to ControlNet checkpoint fine-tuned for mask conditioning (defaults to `--model_weights_path`) |
+| `--edge_model_path` | Path to a single edge ControlNet checkpoint (deprecated, use `--edge_model_paths`) |
+| `--edge_model_paths` | Edge ControlNet checkpoints as `<name>=/path/to/model.ckpt` |
+| `--rgba_model_path` | Checkpoint for RGBA ControlNet (defaults to `--model_weights_path`) |
+
+### Condition Directory Options
+| Option | Description |
+|---|---|
+| `--edge_dir` | Path to precomputed edge images |
+| `--edge_dirs` | Edge directories as `<name>=/path/to/edges` (names must match `--edge_model_paths`) |
+| `--rgba_dir` | Directory containing RGBA npz/png control tensors (required for `generation_mode=rgba`) |
+
+### Sampling Parameters
+| Option | Default | Description |
+|---|---|---|
+| `--ddim_steps` | `70` | Number of DDIM sampling steps |
+| `--strength` | `2.0` | ControlNet conditioning strength |
+| `--scale` | `9.0` | Classifier-free guidance scale |
+| `--seed` | `-1` | Random seed (`-1` for random each time) |
+| `--eta` | `1.0` | DDIM eta parameter for stochasticity |
+| `--guess_mode` | `False` | Enable guess mode (less strict conditioning) |
+
+### Multi-Condition Strength Control
+| Option | Description |
+|---|---|
+| `--mask_strength` | Relative strength for the mask ControlNet branch (defaults to `1.0`) |
+| `--edge_strengths` | Relative strengths for edge branches as `<name>=<float>` |
+| `--skip_missing_edges` | Skip samples with missing edge condition files instead of raising an error |
+
+### Generation Modes
+Use `--generation_mode` to select which condition branches to use:
+- `mask_only`: Use only mask conditioning
+- `edge_only`: Use only edge conditioning
+- `mask_and_edge`: Use both mask and edge conditioning (Multi-Condition ControlNet)
+- `rgba`: Use unified RGBA conditioning (single 4-channel branch)
+
+## Multi-Condition ControlNet
+
+The `generate.py` script includes a `MultiConditionControlNet` class that enables simultaneous conditioning on multiple modalities (e.g., segmentation masks and Canny edges). This follows the official ControlNet multi-conditioning design.
+
+### Example: Mask + Edge Generation
+
+```bash
+python generate.py \
+    --generation_mode mask_and_edge \
+    --config_yaml_path ./models/cldm_v15.yaml \
+    --mask_model_path ./models/mask_controlnet.ckpt \
+    --edge_model_paths canny=./models/edge_controlnet.ckpt \
+    --mask_dir /path/to/masks \
+    --edge_dirs canny=/path/to/canny_edges \
+    --mask_strength 1.0 \
+    --edge_strengths canny=1.0 \
+    --output_base_dir ./my_synth_data_multi \
+    --ddim_steps 50 \
+    --scale 9.0
+```
+
+This loads separate ControlNet branches for masks and edges, then aggregates their control signals during generation.
+
+## Project Structure
+
+```
+Natural2Nanoscale/
+├── train.py              # Main training script for ControlNet
+├── generate.py           # Image generation script with multi-condition support
+├── tool_add_control.py   # Utility to prepare SD checkpoint for ControlNet
+├── config.py             # Global configuration (e.g., save_memory flag)
+├── dataset.py            # PyTorch Dataset implementation for training
+├── share.py              # Shared imports and setup
+│
+├── annotator/            # Condition extractors
+│   ├── canny/            # Canny edge detector
+│   ├── hed/              # HED edge detector
+│   ├── midas/            # MiDaS depth estimator
+│   ├── mlsd/             # M-LSD line detector
+│   ├── openpose/         # OpenPose body keypoint detector
+│   └── uniformer/        # Uniformer semantic segmentation
+│
+├── cldm/                 # ControlNet model implementation
+│   ├── cldm.py           # ControlNet architecture
+│   ├── ddim_hacked.py    # Modified DDIM sampler for ControlNet
+│   ├── hack.py           # Model hacking utilities
+│   ├── logger.py         # Image logging for training
+│   └── model.py          # Model creation and loading utilities
+│
+├── ldm/                  # Latent Diffusion Model base code
+│   ├── data/             # Data utilities
+│   ├── models/           # Diffusion model architectures
+│   └── modules/          # Neural network modules (attention, encoders, etc.)
+│
+├── fid/                  # FID/KID computation tools
+│   ├── compute_cem_fid.py    # CEM ResNet50-based FID for EM images
+│   ├── compute_normal_fid.py # ImageNet Inception v3-based FID
+│   ├── pretraining/      # CEM pretraining utilities
+│   ├── weights/          # Downloaded model weights
+│   └── README.md         # Detailed FID tool documentation
+│
+├── utils/                # Utility scripts
+│   └── build_rgba_dataset.py  # Precompute RGBA conditioning tensors
+│
+├── models/               # Model checkpoints and configs
+├── demo/                 # Demo images (edges, masks)
+├── scripts/              # SLURM job scripts
+└── logs/                 # Training logs
+```
+
+### Key Files
+
+| File | Description |
+|---|---|
+| `config.py` | Global settings including `save_memory` flag for low-VRAM environments |
+| `dataset.py` | Custom PyTorch Dataset for loading image/mask/edge pairs |
+| `share.py` | Common imports and initialization shared across scripts |
 
 
