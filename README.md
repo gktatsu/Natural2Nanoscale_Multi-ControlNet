@@ -25,6 +25,7 @@ U-Net can still extract valuable image features from the synthetic samples.*
 [1] Zhang, Lvmin, Anyi Rao, and Maneesh Agrawala. "Adding conditional control to text-to-image diffusion models." Proceedings of the IEEE/CVF international conference on computer vision. 2023.
 
 ## Setup
+
 ### ✅ Requirements Summary
 
 - Python: `3.10.13`
@@ -36,6 +37,7 @@ U-Net can still extract valuable image features from the synthetic samples.*
 ---
 
 ### 🔧 Option 1: Docker
+
 You can download the docker image directly:
 ```bash
 docker run --gpus all -v $PWD:/workspace -it hannahkniesel/natural2nanoscale:latest bash
@@ -44,7 +46,7 @@ docker run --gpus all -v $PWD:/workspace -it hannahkniesel/natural2nanoscale:lat
 Or build your own: 
 ```bash
 docker build -t natural2nanoscale .
-docker run --gpus all -v $PWD:/workspace -it natural2nanoscale:bash
+docker run --gpus all -v $PWD:/workspace -it natural2nanoscale bash
 ```
 
 Make sure you have Docker ≥ 20.10 and the NVIDIA Container Toolkit installed.
@@ -64,6 +66,7 @@ pip install -r req.txt
 ---
 
 ## Model Weights and Data
+
 You can download the all model weights [here](https://viscom.datasets.uni-ulm.de/Natural2Nanoscale/Weights.zip).
 
 If you wish to only download our pretrained controlnet, you can do this [here](https://viscom.datasets.uni-ulm.de/Natural2Nanoscale/ControlNet-Weights.zip)
@@ -76,6 +79,7 @@ The real images originate from Dataset 1 of Devan et al [2]. The data can be fou
 *[2] Shaga Devan, Kavitha, et al. "Weighted average ensemble-based semantic segmentation in biological electron microscopy images." Histochemistry and Cell Biology 158.5 (2022): 447-462.*
 
 ## Train ControlNet
+
 You will need to download the initial sd1.5 checkpoint. There are two options to do this:
 1.  You can download `v1-5-pruned.ckpt` from [here](https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/tree/main) and move it to the `models` directory. Then run `python tool_add_control.py ./models/v1-5-pruned.ckpt ./models/control_sd15_ini.ckpt` to prepare the checkpoint for the controlnet architecture.
 
@@ -88,7 +92,7 @@ python train.py \
     --learning_rate 1e-5 \
     --image_path /path/to/my/images \
     --mask_path /path/to/my/masks \
-    --resume ./models/control_sd15_ini.ckpt \
+    --resume_path ./models/control_sd15_ini.ckpt \
     --gpus 1 \
     --precision 32 \
     --wandb_api_key YOUR_WANDB_KEY_HERE
@@ -105,13 +109,15 @@ python train.py \
     --image_path /path/to/my/images \
     --rgba_path /path/to/my_rgba/train \
     --val_rgba_path /path/to/my_rgba/val \
-    --resume ./models/control_sd15_ini.ckpt \
+    --resume_path ./models/control_sd15_ini.ckpt \
     --gpus 1
 ```
 
 When `condition_type=rgba` the trainer automatically instantiates a ControlNet whose hint branch expects 4 channels.
 
-## Precompute RGBA conditioning
+---
+
+## Precompute RGBA Conditioning
 
 Use `utils/build_rgba_dataset.py` to fuse masks and freshly computed Canny edges into `(H, W, 4)` tensors before launching cluster jobs:
 
@@ -125,9 +131,28 @@ python utils/build_rgba_dataset.py \
     --preview-max 32
 ```
 
+### RGBA Build Options
+
+| Option | Default | Description |
+|---|---|---|
+| `--img_dir` | (required) | Directory containing source images |
+| `--mask_dir` | (required) | Directory containing mask images (grayscale labels) |
+| `--dest_dir` | (required) | Base directory for output RGBA tensors |
+| `--fmt` | `npz` | Output format(s): `npz`, `png`, or both |
+| `--preview_dir` | `<dest_dir>/preview` | Directory for preview panels |
+| `--preview-max` | `32` | Maximum number of preview panels to save |
+| `--num-mask-classes` | `3` | Number of mask classes to one-hot encode |
+| `--canny-low` | `100` | Lower hysteresis threshold for Canny |
+| `--canny-high` | `200` | Upper hysteresis threshold for Canny |
+| `--beta-edge` | `1.0` | Multiplier for edge channel before normalization |
+| `--overwrite` | `False` | Overwrite existing outputs |
+
 The script stores compressed `.npz` tensors (mask RGB in channels R/G/B, Canny edge in channel A) and optional `preview/*.png` triptychs (original/mask/edge) to visually inspect alignment before training. The `--dest_dir` acts as the base folder; outputs are written to `<dest_dir>/<canny_low>_<canny_high>` so each threshold pair stays isolated automatically.
 
+---
+
 ## Generate Images
+
 To generate images with a pretrained ControlNet do: 
 ```bash
 python generate.py \
@@ -152,21 +177,57 @@ python generate.py \
 
 The same RGBA tensors used for training can be re-used during inference, ensuring parity between train/test pipelines.
 
-## Additional Training Options
+---
 
-The `train.py` script supports many additional command-line options beyond the basic examples above:
+## Training Options Reference
+
+The `train.py` script supports many command-line options:
+
+### Core Training Parameters
+
+| Option | Default | Description |
+|---|---|---|
+| `--batch_size` | `2` | Batch size for training |
+| `--learning_rate` | `1e-5` | Learning rate for the optimizer |
+| `--logger_freq` | `300` | Frequency (in batches) to log images to WandB |
+| `--sd_locked` | `True` | Lock the Stable Diffusion backbone during training |
+| `--only_mid_control` | `False` | Only use mid-block control for ControlNet |
+| `--gpus` | `1` | Number of GPUs (0=CPU, -1=all available) |
+| `--precision` | `32` | Floating point precision (16 or 32) |
+| `--num_workers` | `0` | Number of data loading workers |
+| `--output_root` | `./models` | Parent directory for checkpoints and logs |
 
 ### Data Path Options
-| Option | Description |
-|---|---|
-| `--edge_path` | Path to the directory containing training edge maps |
-| `--val_image_path` | Path to validation images |
-| `--val_mask_path` | Path to validation masks |
-| `--val_edge_path` | Path to validation edge maps |
-| `--val_rgba_path` | Path to validation RGBA tensors |
-| `--rgba_alpha_scale` | Scaling factor for the alpha (edge) channel when using `condition_type=rgba` |
+
+| Option | Default | Description |
+|---|---|---|
+| `--image_path` | `data/EM-Dataset/train_images` | Path to training images |
+| `--mask_path` | `data/EM-Dataset/train_masks` | Path to training masks |
+| `--edge_path` | `None` | Path to training edge maps |
+| `--rgba_path` | `None` | Path to training RGBA tensors |
+| `--val_image_path` | `None` | Path to validation images |
+| `--val_mask_path` | `None` | Path to validation masks |
+| `--val_edge_path` | `None` | Path to validation edge maps |
+| `--val_rgba_path` | `None` | Path to validation RGBA tensors |
+| `--rgba_alpha_scale` | `1.0` | Scaling factor for alpha (edge) channel |
+
+### Model Configuration
+
+| Option | Default | Description |
+|---|---|---|
+| `--resume_path` | `./models/control_sd15_ini.ckpt` | Checkpoint to resume from |
+| `--cldm_config_path` | `./models/cldm_v15.yaml` | ControlNet model configuration YAML |
+| `--condition_type` | `segmentation` | Condition modality: `segmentation`, `edge`, or `rgba` |
+
+### WandB Configuration
+
+| Option | Default | Description |
+|---|---|---|
+| `--wandb_project` | `EM-ControlNet` | WandB project name |
+| `--wandb_api_key` | `INSERT KEY` | WandB API key (or use `WANDB_API_KEY` env var) |
 
 ### Validation FID Options
+
 Enable CEM FID computation during training with `--enable_val_fid`:
 
 | Option | Default | Description |
@@ -183,33 +244,36 @@ Enable CEM FID computation during training with `--enable_val_fid`:
 | `--fid_device` | `cuda` | Device for CEM FID feature extraction |
 | `--fid_weights_path` | `None` | Optional local path to pre-downloaded CEM weights |
 | `--fid_download_dir` | `None` | Optional directory to cache downloaded CEM weights |
+| `--fid_seed` | `1234` | Random seed for validation prompt sampling |
 
-### Model Configuration
-| Option | Default | Description |
-|---|---|---|
-| `--cldm_config_path` | `./models/cldm_v15.yaml` | Path to the ControlNet model configuration YAML file |
-| `--condition_type` | `segmentation` | Condition modality: `segmentation`, `edge`, or `rgba` |
+---
 
-## Additional Generation Options
+## Generation Options Reference
 
 The `generate.py` script provides extensive options for fine-grained control over image generation:
 
 ### Model Path Options
-| Option | Description |
-|---|---|
-| `--mask_model_path` | Path to ControlNet checkpoint fine-tuned for mask conditioning (defaults to `--model_weights_path`) |
-| `--edge_model_path` | Path to a single edge ControlNet checkpoint (deprecated, use `--edge_model_paths`) |
-| `--edge_model_paths` | Edge ControlNet checkpoints as `<name>=/path/to/model.ckpt` |
-| `--rgba_model_path` | Checkpoint for RGBA ControlNet (defaults to `--model_weights_path`) |
+
+| Option | Default | Description |
+|---|---|---|
+| `--config_yaml_path` | `./models/cldm_v15.yaml` | Path to ControlNet model configuration YAML |
+| `--model_weights_path` | `./models/EM_best_results.ckpt` | Path to ControlNet model weights checkpoint |
+| `--mask_model_path` | `None` | Path to mask-conditioned ControlNet (defaults to `--model_weights_path`) |
+| `--edge_model_path` | `None` | Single edge ControlNet checkpoint (deprecated, use `--edge_model_paths`) |
+| `--edge_model_paths` | `[]` | Edge ControlNet checkpoints as `<name>=/path/to/model.ckpt` |
+| `--rgba_model_path` | `None` | Checkpoint for RGBA ControlNet (defaults to `--model_weights_path`) |
 
 ### Condition Directory Options
-| Option | Description |
-|---|---|
-| `--edge_dir` | Path to precomputed edge images |
-| `--edge_dirs` | Edge directories as `<name>=/path/to/edges` (names must match `--edge_model_paths`) |
-| `--rgba_dir` | Directory containing RGBA npz/png control tensors (required for `generation_mode=rgba`) |
+
+| Option | Default | Description |
+|---|---|---|
+| `--mask_dir` | (required for mask modes) | Path to input mask images |
+| `--edge_dir` | `None` | Path to precomputed edge images |
+| `--edge_dirs` | `[]` | Edge directories as `<name>=/path/to/edges` |
+| `--rgba_dir` | `None` | Directory containing RGBA npz/png control tensors |
 
 ### Sampling Parameters
+
 | Option | Default | Description |
 |---|---|---|
 | `--ddim_steps` | `70` | Number of DDIM sampling steps |
@@ -220,18 +284,33 @@ The `generate.py` script provides extensive options for fine-grained control ove
 | `--guess_mode` | `False` | Enable guess mode (less strict conditioning) |
 
 ### Multi-Condition Strength Control
-| Option | Description |
-|---|---|
-| `--mask_strength` | Relative strength for the mask ControlNet branch (defaults to `1.0`) |
-| `--edge_strengths` | Relative strengths for edge branches as `<name>=<float>` |
-| `--skip_missing_edges` | Skip samples with missing edge condition files instead of raising an error |
+
+| Option | Default | Description |
+|---|---|---|
+| `--mask_strength` | `1.0` | Relative strength for mask ControlNet branch |
+| `--edge_strengths` | `[]` | Relative strengths for edge branches as `<name>=<float>` |
+| `--skip_missing_edges` | `False` | Skip samples with missing edge files instead of erroring |
 
 ### Generation Modes
+
 Use `--generation_mode` to select which condition branches to use:
-- `mask_only`: Use only mask conditioning
-- `edge_only`: Use only edge conditioning
-- `mask_and_edge`: Use both mask and edge conditioning (Multi-Condition ControlNet)
-- `rgba`: Use unified RGBA conditioning (single 4-channel branch)
+
+| Mode | Description |
+|---|---|
+| `mask_only` | Use only mask conditioning |
+| `edge_only` | Use only edge conditioning |
+| `mask_and_edge` | Use both mask and edge conditioning (Multi-Condition ControlNet) |
+| `rgba` | Use unified RGBA conditioning (single 4-channel branch) |
+
+### Output Options
+
+| Option | Default | Description |
+|---|---|---|
+| `--output_base_dir` | `my_synth_data` | Base directory for generated images and masks |
+| `--n_augmentations_per_mask` | `1` | Number of synthetic images per input mask |
+| `--batch_size_per_inference` | `1` | Number of samples per inference call |
+
+---
 
 ## Multi-Condition ControlNet
 
@@ -255,6 +334,24 @@ python generate.py \
 ```
 
 This loads separate ControlNet branches for masks and edges, then aggregates their control signals during generation.
+
+---
+
+## FID / KID Computation
+
+See [fid/README.md](fid/README.md) for detailed documentation on computing FID and KID metrics.
+
+### Quick Start
+
+```bash
+# CEM FID for EM images
+python fid/compute_cem_fid.py /path/to/real /path/to/generated --backbone cem500k
+
+# Standard Inception FID
+python fid/compute_normal_fid.py /path/to/real /path/to/generated
+```
+
+---
 
 ## Project Structure
 
@@ -290,17 +387,19 @@ Natural2Nanoscale/
 ├── fid/                  # FID/KID computation tools
 │   ├── compute_cem_fid.py    # CEM ResNet50-based FID for EM images
 │   ├── compute_normal_fid.py # ImageNet Inception v3-based FID
-│   ├── pretraining/      # CEM pretraining utilities
-│   ├── weights/          # Downloaded model weights
+│   ├── pretraining/      # CEM pretraining utilities (MoCo v2, SwAV)
 │   └── README.md         # Detailed FID tool documentation
 │
 ├── utils/                # Utility scripts
 │   └── build_rgba_dataset.py  # Precompute RGBA conditioning tensors
 │
 ├── models/               # Model checkpoints and configs
+│   ├── cldm_v15.yaml     # ControlNet model configuration
+│   ├── control_sd15_ini.ckpt  # Initial SD1.5 checkpoint for ControlNet
+│   └── saved/            # Saved training runs
+│
 ├── demo/                 # Demo images (edges, masks)
-├── scripts/              # SLURM job scripts
-└── logs/                 # Training logs
+└── my_synth_data/        # Default output directory for generated images
 ```
 
 ### Key Files
@@ -308,7 +407,27 @@ Natural2Nanoscale/
 | File | Description |
 |---|---|
 | `config.py` | Global settings including `save_memory` flag for low-VRAM environments |
-| `dataset.py` | Custom PyTorch Dataset for loading image/mask/edge pairs |
+| `dataset.py` | Custom PyTorch Dataset for loading image/mask/edge/RGBA pairs with augmentation |
 | `share.py` | Common imports and initialization shared across scripts |
+| `cldm/model.py` | Model creation with config overrides for RGBA (4-channel) ControlNet |
 
+---
 
+## Citation
+
+If you use this code in your research, please cite:
+
+```bibtex
+@inproceedings{kniesel2025natural,
+  title={From Natural to Nanoscale: Training ControlNet on Scarce FIB-SEM Data for Augmenting Semantic Segmentation Data},
+  author={Kniesel, Hannah and Rapp, Pascal and Hermosilla, Pedro and Ropinski, Timo},
+  booktitle={ICCVW BIC},
+  year={2025}
+}
+```
+
+---
+
+## License
+
+This project is licensed under the terms of the [LICENSE](LICENSE) file.
